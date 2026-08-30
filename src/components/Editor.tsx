@@ -1,0 +1,762 @@
+import { useState, useRef, useEffect } from 'react';
+import { ArrowLeft, Music, LayoutGrid, MoreVertical, Play, Pause, Mic, FileAudio, Download, CheckSquare, Square, Volume2, CheckCircle2, Loader2 } from 'lucide-react';
+import { ViewState, SubtitleLine } from '../types';
+import JSZip from 'jszip';
+import { saveAs } from 'file-saver';
+
+interface EditorProps {
+  onNavigate: (view: ViewState) => void;
+  videoFile: File | null;
+  apiKey: string;
+  awsAccessKeyId: string;
+  awsSecretAccessKey: string;
+  awsRegion: string;
+  awsS3Bucket: string;
+  voice: 'Piseth' | 'Sreymom';
+  model: string;
+}
+
+export default function Editor({ onNavigate, videoFile, apiKey, awsAccessKeyId, awsSecretAccessKey, awsRegion, awsS3Bucket, voice, model }: EditorProps) {
+  const [lines, setLines] = useState<SubtitleLine[]>([]);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [transcribeStatus, setTranscribeStatus] = useState<string>('');
+  const [transcribeProgress, setTranscribeProgress] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const [transcribeError, setTranscribeError] = useState<string | null>(null);
+  
+  // Keep track of currently generating audios
+  const [generatingLines, setGeneratingLines] = useState<Set<string>>(new Set());
+  const [ttsBatchProgress, setTtsBatchProgress] = useState({ current: 0, total: 0, active: false });
+  
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRefs = useRef<{ [id: string]: HTMLAudioElement }>({});
+
+  const [videoUrl, setVideoUrl] = useState<string>('');
+
+  useEffect(() => {
+    if (videoFile) {
+      const url = URL.createObjectURL(videoFile);
+      setVideoUrl(url);
+      return () => URL.revokeObjectURL(url);
+    }
+  }, [videoFile]);
+
+  const togglePlay = () => {
+    if (videoRef.current) {
+      if (isPlaying) {
+        videoRef.current.pause();
+      } else {
+        videoRef.current.play();
+      }
+      setIsPlaying(!isPlaying);
+    }
+  };
+
+  const handleTranscribe = async () => {
+    if (lines.length > 0 || !videoFile) return;
+    setIsTranscribing(true);
+    setTranscribeError(null);
+    setDownloadUrl(null);
+    setTranscribeProgress(0);
+    setTranscribeStatus('កំពុងរៀបចំវីដេអូ...');
+    
+    let progressInterval: NodeJS.Timeout | undefined;
+
+    try {
+      const fileId = Date.now().toString();
+      const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
+      const totalChunks = Math.ceil(videoFile.size / CHUNK_SIZE);
+      
+      setTranscribeStatus('កំពុងបញ្ជូនវីដេអូទៅម៉ាស៊ីនមេ...');
+      
+      for (let i = 0; i < totalChunks; i++) {
+        const chunk = videoFile.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+        
+        let chunkRes;
+        let retries = 0;
+        while (retries < 20) {
+          try {
+            chunkRes = await fetch(`/api/upload-chunk?fileId=${fileId}&chunkIndex=${i}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: chunk });
+            if (chunkRes.ok) break;
+          } catch (e) {
+            console.warn(`Chunk ${i} upload failed (attempt ${retries + 1}), retrying...`);
+          }
+          retries++;
+          if (retries === 20) throw new Error('បរាជ័យក្នុងការបញ្ជូនវីដេអូ ដោយសារអ៊ីនធឺណិតខ្សោយ (Network Error - Failed to fetch)');
+          await new Promise(r => setTimeout(r, 2000 * retries)); // Exponential-ish backoff
+        }
+        
+        if (!chunkRes || !chunkRes.ok) {
+          throw new Error('បរាជ័យក្នុងការបញ្ជូនវីដេអូទៅកាន់ម៉ាស៊ីនមេ');
+        }
+        
+        setTranscribeProgress(Math.round(((i + 1) / totalChunks) * 40));
+        
+        // Small delay to prevent rate-limiting from the reverse proxy
+        await new Promise(r => setTimeout(r, 50));
+      }
+
+      setTranscribeStatus('កំពុងចាប់ផ្តើមបកប្រែ...');
+      
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json'
+      };
+      if (apiKey) {
+        headers['x-api-key'] = apiKey;
+      }
+      if (awsAccessKeyId) {
+        headers['x-aws-access-key-id'] = awsAccessKeyId;
+      }
+      if (awsSecretAccessKey) {
+        headers['x-aws-secret-access-key'] = awsSecretAccessKey;
+      }
+      if (awsRegion) {
+        headers['x-aws-region'] = awsRegion;
+      }
+      if (awsS3Bucket) {
+        headers['x-aws-s3-bucket'] = awsS3Bucket;
+      }
+
+      const startRes = await fetch('/api/transcribe/start', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ 
+           fileId, 
+           mimetype: videoFile.type || 'video/mp4', 
+           model,
+           totalChunks
+        }),
+      });
+
+      if (!startRes.ok) {
+        let errorMsg = await startRes.text();
+        try {
+          const parsed = JSON.parse(errorMsg);
+          if (parsed.error) errorMsg = parsed.error;
+        } catch(e) {}
+        throw new Error(errorMsg);
+      }
+
+      const { jobId } = await startRes.json();
+      
+      // Poll for status
+      let isDone = false;
+      let statusRetries = 0;
+      while (!isDone) {
+        await new Promise(r => setTimeout(r, 2000));
+        let statusRes;
+        try {
+          statusRes = await fetch(`/api/transcribe/status?jobId=${jobId}`);
+          statusRetries = 0; // reset on success
+        } catch (e) {
+          console.error('Status check failed, retrying...', e);
+          statusRetries++;
+          if (statusRetries >= 5) {
+            throw new Error('ដាច់ការភ្ជាប់ជាមួយម៉ាស៊ីនមេ (Connection Lost - Failed to fetch)');
+          }
+          continue;
+        }
+
+        if (!statusRes.ok) {
+           if (statusRes.status === 404) throw new Error('ម៉ាស៊ីនមេមានបញ្ហា (Job not found) សូមព្យាយាមម្តងទៀត');
+           throw new Error('បរាជ័យក្នុងការត្រួតពិនិត្យដំណើរការ (Failed to fetch status)');
+        }
+        
+        const job = await statusRes.json();
+        
+        if (job.status === 'error') {
+           throw new Error(job.error || 'មានបញ្ហាក្នុងការបកប្រែ');
+        }
+        
+        if (job.status === 'done') {
+          const newLines = job.lines.map((l: any, idx: number) => ({
+            ...l,
+            id: l.id || `line-${Date.now()}-${idx}`,
+            selected: true,
+            generated: false,
+            audioUrl: null
+          }));
+          setLines(newLines);
+          setTranscribeProgress(100);
+          setTranscribeStatus('រួចរាល់!');
+          // Server will handle 0 lines check
+          isDone = true;
+        } else {
+          setTranscribeProgress(job.progress || 50);
+          if (job.status === 'extracting audio') setTranscribeStatus('កំពុងទាញសំឡេងចេញពីវីដេអូដើម្បីផ្ញើទៅ AI...');
+          else if (job.status === 'uploading to gemini') setTranscribeStatus('កំពុងបញ្ចូលវីដេអូទៅ AI...');
+          else if (job.status === 'processing video') setTranscribeStatus('AI កំពុងវិភាគវីដេអូ...');
+          else if (job.status === 'generating subtitles') setTranscribeStatus('កំពុងទាញយកអត្ថបទបកប្រែ...');
+        }
+      }
+    } catch (err: any) {
+      console.error(err);
+      setTranscribeError(err.message);
+    } finally {
+      // no interval
+      setTimeout(() => {
+        setIsTranscribing(false);
+      }, 800);
+    }
+  };
+
+  const toggleSelectAll = () => {
+    const allSelected = lines.length > 0 && lines.every(l => l.selected);
+    setLines(lines.map(l => ({ ...l, selected: !allSelected })));
+  };
+
+  const toggleSelect = (id: string) => {
+    setLines(lines.map(l => l.id === id ? { ...l, selected: !l.selected } : l));
+  };
+
+  const generateAudioForLine = async (lineId: string, text: string) => {
+    try {
+      setGeneratingLines(prev => {
+        const next = new Set(prev);
+        next.add(lineId);
+        return next;
+      });
+
+      const res = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, voice })
+      });
+
+      if (!res.ok) throw new Error('TTS Failed');
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      
+      setLines(prev => prev.map(l => l.id === lineId ? { ...l, generated: true, audioUrl: url } : l));
+    } catch (err) {
+      console.error(err);
+      alert('Failed to generate audio for line');
+    } finally {
+      setGeneratingLines(prev => {
+        const next = new Set(prev);
+        next.delete(lineId);
+        return next;
+      });
+    }
+  };
+
+  const handleGenerateAI = async () => {
+    const selectedLines = lines.filter(l => l.selected && !l.generated);
+    if (selectedLines.length === 0) return;
+    
+    setTtsBatchProgress({ current: 0, total: selectedLines.length, active: true });
+    let completed = 0;
+    
+    for (const line of selectedLines) {
+      await generateAudioForLine(line.id, line.text);
+      completed++;
+      setTtsBatchProgress(prev => ({ ...prev, current: completed }));
+    }
+    
+    setTimeout(() => {
+      setTtsBatchProgress({ current: 0, total: 0, active: false });
+    }, 1000);
+  };
+
+  const playAudio = (url: string) => {
+    const audio = new Audio(url);
+    audio.play();
+  };
+
+  const handleExport = async () => {
+    setIsExporting(true);
+    setExportProgress(0);
+    
+    // We will poll progress from server
+    
+    try {
+      const toSrtTime = (timeStr: string) => {
+        const parts = timeStr.split(':');
+        if (parts.length < 2) return "00:00:00,000";
+        let h = "00", m = "00", s = "00", ms = "000";
+        
+        if (parts.length === 3) {
+          h = parts[0].padStart(2, '0');
+          m = parts[1].padStart(2, '0');
+          const secParts = parts[2].split('.');
+          s = secParts[0].padStart(2, '0');
+          ms = (secParts[1] ? secParts[1].substring(0,3).padEnd(3, '0') : "000");
+        } else {
+          m = parts[0].padStart(2, '0');
+          const secParts = parts[1].split('.');
+          s = secParts[0].padStart(2, '0');
+          ms = (secParts[1] ? secParts[1].substring(0,3).padEnd(3, '0') : "000");
+        }
+        return `${h}:${m}:${s},${ms}`;
+      };
+
+      const srtContent = lines.map((line, index) => {
+        return `${index + 1}\n${toSrtTime(line.start)} --> ${toSrtTime(line.end)}\n${line.text}\n`;
+      }).join('\n');
+
+      const baseName = videoFile?.name.replace(/\.[^/.]+$/, "") || 'video';
+
+      let videoFileId = '';
+      let videoTotalChunks = 0;
+      
+      if (videoFile) {
+         videoFileId = 'export_' + Date.now().toString();
+         const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
+         videoTotalChunks = Math.ceil(videoFile.size / CHUNK_SIZE);
+         
+         for (let i = 0; i < videoTotalChunks; i++) {
+           const chunk = videoFile.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+           let retries = 0;
+           let chunkRes;
+           while (retries < 10) {
+             try {
+               chunkRes = await fetch(`/api/upload-chunk?fileId=${videoFileId}&chunkIndex=${i}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: chunk });
+               if (chunkRes.ok) break;
+             } catch (e) {}
+             retries++;
+             await new Promise(r => setTimeout(r, 1000));
+           }
+           if (!chunkRes || !chunkRes.ok) throw new Error('បរាជ័យក្នុងការបញ្ជូនវីដេអូទៅកាន់ម៉ាស៊ីនមេសម្រាប់ការនាំចេញ');
+           setExportProgress(Math.round(((i + 1) / videoTotalChunks) * 50)); // Upload takes up to 50%
+           await new Promise(r => setTimeout(r, 50)); // small delay to prevent rate limit
+         }
+      }
+
+      const formData = new FormData();
+      if (videoFileId) {
+        formData.append('videoFileId', videoFileId);
+        formData.append('videoTotalChunks', videoTotalChunks.toString());
+      }
+      formData.append('srt', new Blob([srtContent], { type: 'text/srt' }), 'subtitles.srt');
+      
+      const audioMetadata = [];
+      const audioLines = lines.filter(l => l.audioUrl);
+      
+      for (let i = 0; i < audioLines.length; i++) {
+        const line = audioLines[i];
+        const audioData = await fetch(line.audioUrl as string).then(r => r.blob());
+        const key = `audio_${i}`;
+        formData.append(key, audioData, `${key}.mp3`);
+        audioMetadata.push({ key, start: line.start });
+      }
+      
+      formData.append('metadata', JSON.stringify(audioMetadata));
+      
+      const res = await fetch('/api/export-video', {
+         method: 'POST',
+         body: formData
+      });
+      
+      if (!res.ok) {
+         let errMsg = 'បរាជ័យក្នុងការបំប្លែងវីដេអូ';
+         try {
+            const errData = await res.json();
+            if (errData.error) errMsg = errData.error;
+         } catch(e) {}
+         throw new Error(errMsg);
+      }
+      
+      const { jobId } = await res.json();
+      
+      let pollFailCount = 0;
+      // Poll for status
+      while (true) {
+        await new Promise(r => setTimeout(r, 1000));
+        let statusRes;
+        try {
+          statusRes = await fetch(`/api/export/status/${jobId}`);
+        } catch (e) {
+          pollFailCount++;
+          if (pollFailCount > 5) throw new Error('ដាច់ការភ្ជាប់ជាមួយម៉ាស៊ីនមេ (Network Error)');
+          continue;
+        }
+
+        if (!statusRes.ok) {
+          if (statusRes.status === 404) {
+             throw new Error('ដំណើរការត្រូវកាត់ផ្តាច់ (Server Restarted)។ សូមសាកល្បង Export ម្តងទៀត ហើយកុំបិទអេក្រង់ ឬប្តូរកម្មវិធីពេលកំពុងដំណើរការ។');
+          }
+          pollFailCount++;
+          if (pollFailCount > 5) throw new Error('បរាជ័យក្នុងការត្រួតពិនិត្យដំណើរការ (Server Error)');
+          continue;
+        }
+        pollFailCount = 0; // reset
+        const statusData = await statusRes.json();
+        
+        if (statusData.progress) {
+            setExportProgress(statusData.progress);
+        }
+        
+        if (statusData.status === 'completed') {
+           setExportProgress(100);
+           // Force a fresh URL with timestamp to prevent cache issues
+           const version = Date.now();
+           setDownloadUrl(`/api/export/download/${jobId}?filename=${encodeURIComponent(baseName + '_khmer.mp4')}&v=${version}`);
+           break;
+        } else if (statusData.status === 'error') {
+           throw new Error(statusData.error || 'បរាជ័យក្នុងការបំប្លែងវីដេអូ');
+        }
+      }
+      
+    } catch (err: any) {
+      console.error(err);
+      setTranscribeError(err.message || "មានបញ្ហាក្នុងការនាំចេញឯកសារ (Export Failed)");
+    } finally {
+      // clearInterval(progressInterval);
+      setTimeout(() => setIsExporting(false), 500);
+    }
+  };
+
+  const selectedCount = lines.filter(l => l.selected).length;
+  const generatedCount = lines.filter(l => l.generated).length;
+  const totalCount = lines.length;
+
+  return (
+    <div className="flex flex-col h-full bg-[#0f0f13]">
+      {/* Top Header */}
+      <div className="flex items-center justify-between p-4 bg-gray-950/80 backdrop-blur-md z-10">
+        <button onClick={() => onNavigate('home')} className="p-2 -ml-2 text-gray-300 hover:text-white transition">
+          <ArrowLeft size={24} />
+        </button>
+        <div className="truncate flex-1 text-center font-medium text-sm text-gray-200 px-4">
+          {videoFile?.name || '[2010년 사극 레전드] 동이 Dong Yi.mp4'}
+        </div>
+        <div className="flex items-center gap-4 text-gray-400">
+          <Music size={20} className="hover:text-white cursor-pointer" />
+          <LayoutGrid size={20} className="hover:text-white cursor-pointer" />
+          <MoreVertical size={20} className="hover:text-white cursor-pointer" />
+        </div>
+      </div>
+
+      {/* Video Player Area */}
+      <div className="relative w-full aspect-video bg-black flex items-center justify-center group shrink-0">
+        {videoFile && videoUrl ? (
+          <video 
+            ref={videoRef}
+            src={videoUrl} 
+            className="w-full h-full object-contain"
+            onEnded={() => setIsPlaying(false)}
+            onClick={togglePlay}
+          />
+        ) : (
+          <div className="text-gray-600 text-sm">No video selected</div>
+        )}
+        <button 
+          onClick={togglePlay}
+          className={`absolute inset-0 flex items-center justify-center bg-black/20 transition duration-300 ${isPlaying ? 'opacity-0 group-hover:opacity-100' : 'opacity-100'}`}
+        >
+          <div className="w-14 h-14 flex items-center justify-center bg-black/50 rounded-full text-white backdrop-blur-sm shadow-lg">
+            {isPlaying ? <Pause size={28} /> : <Play size={28} className="ml-1" />}
+          </div>
+        </button>
+        <div className="absolute bottom-3 right-3 p-1.5 bg-black/60 backdrop-blur-sm rounded text-gray-300">
+          <Volume2 size={16} />
+        </div>
+      </div>
+
+      {/* Subtitle List Header */}
+      <div className="flex items-center justify-between px-4 py-2.5 bg-gray-900 border-y border-gray-800 text-xs text-gray-400 shrink-0">
+        <div className="flex items-center gap-3">
+          <button onClick={toggleSelectAll} className="text-gray-400 hover:text-gray-300 transition">
+            {totalCount > 0 && selectedCount === totalCount ? <CheckSquare size={16} className="text-pink-500" /> : <Square size={16} />}
+          </button>
+          <span>{selectedCount} selected</span>
+        </div>
+        <div className="flex items-center gap-5">
+          <span className="flex items-center gap-1.5">
+            <span className="text-[10px] border border-gray-600 rounded px-1 text-gray-400 font-medium tracking-wider">A</span> 
+            {totalCount}
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="text-[10px] border border-green-700/50 text-green-500 bg-green-900/20 rounded px-1 font-medium tracking-wider">AI</span> 
+            {generatedCount}
+          </span>
+        </div>
+        <div className="text-[10px] bg-gray-800 px-2 py-1 rounded">Auto-Fit Medium</div>
+      </div>
+
+      {/* Subtitle Lines Area */}
+      <div className="flex-1 overflow-y-auto p-4 relative bg-[#0f0f13]">
+        {lines.length === 0 && !isTranscribing && (
+          <div className="h-full flex flex-col items-center justify-center text-center px-8 animate-in fade-in duration-500">
+            <div className="w-20 h-20 bg-gray-900/50 rounded-3xl flex items-center justify-center border border-gray-800 mb-5">
+              <FileAudio size={32} className="text-gray-500" />
+            </div>
+            <h3 className="text-lg font-bold mb-3 text-gray-200">No lines yet</h3>
+            <p className="text-sm text-gray-500 leading-relaxed max-w-[250px]">
+              Transcribe the video to build them automatically, or import a .srt / .vtt you already have.
+            </p>
+          </div>
+        )}
+
+        {isTranscribing && (
+          <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-[#0f0f13]/95 backdrop-blur-sm animate-in fade-in">
+             <div className="relative flex items-center justify-center w-28 h-28">
+                <svg className="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
+                  <circle cx="50" cy="50" r="42" fill="transparent" stroke="currentColor" strokeWidth="8" className="text-gray-800" />
+                  <circle
+                    cx="50"
+                    cy="50"
+                    r="42"
+                    fill="transparent"
+                    stroke="url(#progress-gradient)"
+                    strokeWidth="8"
+                    strokeLinecap="round"
+                    className="transition-all duration-300 ease-out"
+                    style={{
+                      strokeDasharray: 263.89,
+                      strokeDashoffset: 263.89 - (transcribeProgress / 100) * 263.89,
+                    }}
+                  />
+                  <defs>
+                    <linearGradient id="progress-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                      <stop offset="0%" stopColor="#db2777" />
+                      <stop offset="100%" stopColor="#dc2626" />
+                    </linearGradient>
+                  </defs>
+                </svg>
+                <div className="absolute inset-0 flex flex-col items-center justify-center">
+                  <span className="text-3xl font-bold text-white tracking-tighter">
+                    {Math.round(transcribeProgress)}<span className="text-base text-gray-400 ml-0.5">%</span>
+                  </span>
+                </div>
+             </div>
+          </div>
+        )}
+
+        {ttsBatchProgress.active && (
+          <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-[#0f0f13]/95 backdrop-blur-sm animate-in fade-in">
+             <div className="relative flex items-center justify-center w-24 h-24">
+                <svg className="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
+                  <circle cx="50" cy="50" r="42" fill="transparent" stroke="currentColor" strokeWidth="8" className="text-gray-800" />
+                  <circle
+                    cx="50"
+                    cy="50"
+                    r="42"
+                    fill="transparent"
+                    stroke="#6366f1"
+                    strokeWidth="8"
+                    strokeLinecap="round"
+                    className="transition-all duration-300 ease-out"
+                    style={{
+                      strokeDasharray: 263.89,
+                      strokeDashoffset: 263.89 - ((ttsBatchProgress.current / Math.max(ttsBatchProgress.total, 1))) * 263.89,
+                    }}
+                  />
+                </svg>
+                <div className="absolute inset-0 flex flex-col items-center justify-center">
+                  <Mic size={20} className="text-indigo-400 mb-1" />
+                  <span className="text-lg font-bold text-white tracking-tighter">
+                    {ttsBatchProgress.current}<span className="text-xs text-gray-400 mx-0.5">/</span>{ttsBatchProgress.total}
+                  </span>
+                </div>
+             </div>
+             <div className="text-sm font-medium text-indigo-500 mb-2 flex items-center gap-2">
+                <Loader2 size={16} className="animate-spin" /> កំពុងបង្កើតសំឡេង...
+             </div>
+          </div>
+        )}
+
+        {transcribeError && (
+          <div className="mx-4 my-4 p-4 bg-red-900/30 border border-red-900/50 rounded-xl text-red-400 text-sm animate-in fade-in flex items-start gap-3">
+            <div className="mt-0.5"><Square size={16} className="text-red-500" /></div>
+            <div>
+              <div className="font-bold mb-1 text-red-300">ដំណើរការបរាជ័យ (Process Failed)</div>
+              <div className="break-all">{transcribeError}</div>
+              <button 
+                onClick={() => setTranscribeError(null)}
+                className="mt-2 text-xs bg-red-900/50 hover:bg-red-900/80 px-3 py-1.5 rounded-lg transition"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
+
+        {downloadUrl && !isExporting && (
+          <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/80 backdrop-blur-md animate-in fade-in rounded-2xl overflow-y-auto p-6">
+             <div className="flex flex-col items-center justify-center w-full min-h-min my-auto">
+             <div className="w-24 h-24 rounded-full bg-green-900/30 flex items-center justify-center mb-6 border border-green-500/30">
+                <CheckCircle2 size={40} className="text-green-500" />
+             </div>
+             <h3 className="text-2xl font-semibold text-white mb-2">ជោគជ័យ! (Success)</h3>
+             <p className="text-gray-400 mb-6 max-w-sm text-center">វីដេអូរបស់អ្នកត្រូវបាននាំចេញរួចរាល់។ សូមចុច "រក្សាទុក" ឬចុចឱ្យយូរលើវីដេអូដើម្បី Save។</p>
+             <video src={downloadUrl} controls className="w-full max-w-xs rounded-xl shadow-xl border border-gray-700/50 mb-6 bg-black" playsInline></video>
+             <div className="flex flex-col sm:flex-row gap-4">
+                <button 
+                  onClick={async () => {
+                    try {
+                      // Attempt to use Web Share API to save directly to Gallery
+                      const res = await fetch(downloadUrl);
+                      if (!res.ok) {
+                         alert("រកមិនឃើញវីដេអូទេ (Server អាចនឹង Restart)។ សូម Export ម្តងទៀត។");
+                         return;
+                      }
+                      const blob = await res.blob();
+                      const file = new File([blob], 'exported_video_khmer.mp4', { type: 'video/mp4' });
+                      
+                      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+                        await navigator.share({
+                          files: [file],
+                          title: 'Exported Video'
+                        });
+                      } else {
+                        // Fallback to normal download
+                        const a = document.createElement('a');
+                        a.href = URL.createObjectURL(blob);
+                        a.download = 'exported_video_khmer.mp4';
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                      }
+                    } catch (e) {
+                      console.error("Share failed", e);
+                      // Fallback to normal download
+                      const a = document.createElement('a');
+                      a.href = downloadUrl;
+                      a.download = 'exported_video_khmer.mp4';
+                      document.body.appendChild(a);
+                      a.click();
+                      document.body.removeChild(a);
+                    }
+                  }}
+                  className="px-8 py-3 bg-green-600 hover:bg-green-500 text-white rounded-xl font-medium transition flex items-center gap-2"
+                >
+                   <Download size={20} /> រក្សាទុកចូល Gallery (Share)
+                </button>
+                <button onClick={() => setDownloadUrl(null)} className="px-6 py-3 bg-gray-800 hover:bg-gray-700 text-white rounded-xl font-medium transition">
+                   បិទ (Close)
+                </button>
+             </div>
+             </div>
+          </div>
+        )}
+        {isExporting && (
+          <div className="absolute inset-0 bg-[#0f0f13]/95 z-20 flex flex-col items-center justify-center p-8 animate-in fade-in overflow-hidden">
+             <div className="w-32 h-32 relative mb-6">
+                <svg className="w-full h-full -rotate-90" viewBox="0 0 100 100">
+                  <circle cx="50" cy="50" r="42" stroke="#1f2937" strokeWidth="8" fill="none" />
+                  <circle 
+                    cx="50" cy="50" r="42" 
+                    stroke="url(#export-gradient)" 
+                    strokeWidth="8" 
+                    fill="none" 
+                    strokeLinecap="round"
+                    className="transition-all duration-300 ease-out"
+                    style={{
+                      strokeDasharray: 263.89,
+                      strokeDashoffset: 263.89 - (exportProgress / 100) * 263.89,
+                    }}
+                  />
+                  <defs>
+                    <linearGradient id="export-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                      <stop offset="0%" stopColor="#16a34a" />
+                      <stop offset="100%" stopColor="#22c55e" />
+                    </linearGradient>
+                  </defs>
+                </svg>
+                <div className="absolute inset-0 flex flex-col items-center justify-center">
+                  <span className="text-3xl font-bold text-white tracking-tighter">
+                    {Math.round(exportProgress)}<span className="text-base text-gray-400 ml-0.5">%</span>
+                  </span>
+                </div>
+             </div>
+             <div className="text-sm font-medium text-green-500 mb-6">កំពុងនាំចេញវីដេអូ...</div>
+          </div>
+        )}
+
+        <div className="space-y-3 pb-4">
+          {lines.map((line, idx) => (
+            <div key={line.id} className={`flex gap-3 bg-gray-900/80 rounded-xl p-3.5 border transition duration-200 ${line.selected ? 'border-pink-900/50 shadow-[0_0_10px_rgba(219,39,119,0.05)]' : 'border-gray-800'} items-start animate-in slide-in-from-bottom-2`} style={{ animationDelay: `${idx * 100}ms`, animationFillMode: 'both' }}>
+              <button onClick={() => toggleSelect(line.id)} className="mt-0.5 shrink-0 transition">
+                {line.selected ? <CheckSquare size={18} className="text-pink-500" /> : <Square size={18} className="text-gray-500" />}
+              </button>
+              <div className="flex-1 min-w-0">
+                <div className="flex justify-between items-center text-[11px] text-gray-500 mb-1.5">
+                  <div className="flex items-center gap-2">
+                    <span className="bg-gray-800 text-gray-400 px-1.5 py-0.5 rounded-sm font-medium">{idx + 1}</span>
+                    <span className="font-mono tracking-tighter">{line.start} - {line.end}</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                     <div className="w-5 h-5 rounded bg-gray-800/80 flex items-center justify-center text-blue-400">
+                       <span className="text-[10px]">{voice === 'Piseth' ? '♂' : '♀'}</span>
+                     </div>
+                  </div>
+                </div>
+                <textarea 
+                  className="w-full bg-transparent text-sm font-medium text-gray-200 leading-relaxed outline-none resize-none border-b border-transparent focus:border-pink-500 transition-colors h-14"
+                  value={line.text}
+                  onChange={(e) => setLines(lines.map(l => l.id === line.id ? { ...l, text: e.target.value, generated: false } : l))}
+                />
+                
+                {generatingLines.has(line.id) && (
+                  <div className="text-[10px] text-indigo-400 flex items-center gap-1.5 mt-2.5 font-medium">
+                    <Loader2 size={12} className="animate-spin" /> កំពុងបង្កើត...
+                  </div>
+                )}
+                
+                {line.generated && !generatingLines.has(line.id) && (
+                  <div className="text-[10px] text-green-500 flex items-center gap-1.5 mt-2.5 font-medium bg-green-900/10 inline-flex px-2 py-0.5 rounded-full border border-green-900/30">
+                    <CheckCircle2 size={12} /> បានបង្កើតសំឡេង
+                  </div>
+                )}
+              </div>
+              <button 
+                onClick={() => line.audioUrl && playAudio(line.audioUrl)}
+                disabled={!line.audioUrl}
+                className={`shrink-0 w-8 h-8 rounded-full flex items-center justify-center self-center transition ${line.audioUrl ? 'bg-gray-800 hover:bg-pink-900/30 text-gray-400 hover:text-pink-500 cursor-pointer' : 'bg-gray-900 text-gray-700 cursor-not-allowed'}`}
+              >
+                <Play size={14} className="ml-0.5" />
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Bottom Action Bar */}
+      <div className="bg-gray-950/90 backdrop-blur-md p-4 border-t border-gray-900 grid grid-cols-3 gap-3 shrink-0 pb-6 z-20">
+        <button 
+          onClick={handleTranscribe}
+          disabled={lines.length > 0}
+          className={`flex flex-col items-center justify-center gap-1.5 py-3 px-1 rounded-xl border transition-all ${
+            lines.length === 0 
+              ? 'bg-pink-900/20 text-pink-500 border-pink-900/30 hover:bg-pink-900/30' 
+              : 'bg-gray-900/50 text-gray-600 border-gray-800 cursor-not-allowed'
+          }`}
+        >
+          <FileAudio size={22} className={lines.length === 0 ? "text-pink-400" : ""} />
+          <span className="text-[11px] font-medium tracking-wide">បកប្រែជាអក្សរ</span>
+          <span className="text-[9px] opacity-60">{totalCount > 0 ? `${totalCount}/${totalCount}` : '0/0'}</span>
+        </button>
+        <button 
+          onClick={handleGenerateAI}
+          disabled={selectedCount === 0 || generatedCount === totalCount && totalCount > 0}
+          className={`flex flex-col items-center justify-center gap-1.5 py-3 px-1 rounded-xl border transition-all ${
+            selectedCount > 0 
+              ? 'bg-indigo-900/20 text-indigo-400 border-indigo-900/40 hover:bg-indigo-900/30 shadow-[0_0_15px_rgba(79,70,229,0.1)]' 
+              : 'bg-gray-900/50 text-gray-600 border-gray-800 cursor-not-allowed'
+          }`}
+        >
+          <Mic size={22} />
+          <span className="text-[11px] font-medium tracking-wide">បង្កើតសំឡេង AI</span>
+          <span className="text-[9px] opacity-60">{generatedCount}/{totalCount} បានបង្កើត</span>
+        </button>
+        <button 
+          onClick={handleExport}
+          disabled={lines.length === 0 || isExporting}
+          className={`flex flex-col items-center justify-center gap-1.5 py-3 px-1 rounded-xl border transition-all ${
+            lines.length > 0 
+              ? 'bg-green-900/20 text-green-500 border-green-900/40 hover:bg-green-900/30 shadow-[0_0_15px_rgba(34,197,94,0.1)]' 
+              : 'bg-gray-900/50 text-gray-600 border-gray-800 cursor-not-allowed'
+          }`}
+        >
+          <Download size={22} />
+          <span className="text-[11px] font-medium tracking-wide">នាំចេញវីដេអូ</span>
+        </button>
+      </div>
+    </div>
+  );
+}

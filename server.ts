@@ -1,0 +1,839 @@
+import * as dotenv from 'dotenv';
+dotenv.config();
+import { S3Client, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import { TranscribeClient, StartTranscriptionJobCommand, GetTranscriptionJobCommand } from "@aws-sdk/client-transcribe";
+import fetch from "node-fetch";
+import express from 'express';
+import * as crypto from 'crypto';
+import path from 'path';
+import multer from 'multer';
+import { EdgeTTS } from 'node-edge-tts';
+import { GoogleGenAI, Type } from '@google/genai';
+import fs from 'fs';
+import os from 'os';
+import { exec, spawn } from 'child_process';
+import util from 'util';
+
+const execAsync = util.promisify(exec);
+
+
+function logFfmpegDiagnostic(stepName, command, error, stderr, stdout) {
+  const timestamp = new Date().toISOString();
+  console.error(`\n[FFMPEG DIAGNOSTIC LOG - ${timestamp}]`);
+  console.error(`STEP: ${stepName}`);
+  console.error(`COMMAND: ${command}`);
+  if (error) {
+    console.error(`ERROR OBJECT: ${error.message || error}`);
+  }
+  if (stderr) {
+    console.error(`STDERR:\n${stderr}`);
+  }
+  if (stdout) {
+    console.error(`STDOUT:\n${stdout}`);
+  }
+  console.error(`[END FFMPEG DIAGNOSTIC]\n`);
+}
+
+const app = express();
+const PORT = 3000;
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true, limit: '500mb' }));
+
+const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 500 * 1024 * 1024 } });
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+app.post('/api/upload-chunk', express.raw({ type: '*/*', limit: '500mb' }), async (req, res) => {
+  try {
+    const { fileId, chunkIndex } = req.query;
+    if (!req.body || req.body.length === 0) {
+      return res.status(400).json({ error: 'No chunk body provided' });
+    }
+    if (!fileId) {
+      return res.status(400).json({ error: 'Missing fileId in query' });
+    }
+    const chunkPath = path.join(os.tmpdir(), `upload_${fileId}_part_${chunkIndex}`);
+    fs.writeFileSync(chunkPath, req.body);
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const jobs = new Map<string, { status: string, progress: number, lines?: any[], error?: string }>();
+const exportJobs = new Map<string, { status: string; error?: string; path?: string; progress?: number; }>();
+const exportCache = new Map<string, string>();
+
+app.post('/api/transcribe/start', async (req, res) => {
+  const { fileId, mimetype, model, totalChunks } = req.body;
+  const apiKey = req.headers['x-api-key'] as string; // Optional user key from headers
+  const reqAwsAccessKeyId = req.headers['x-aws-access-key-id'] as string;
+  const reqAwsSecretAccessKey = req.headers['x-aws-secret-access-key'] as string;
+  const reqAwsRegion = req.headers['x-aws-region'] as string;
+  const reqAwsS3Bucket = req.headers['x-aws-s3-bucket'] as string;
+  const jobId = Date.now().toString();
+  
+  jobs.set(jobId, { status: 'starting', progress: 40 });
+  res.json({ jobId });
+
+  // Process in background to avoid HTTP timeouts
+  (async () => {
+    try {
+      const filePath = path.join(os.tmpdir(), `upload_${fileId}`);
+      
+      // Merge chunks
+      if (fs.existsSync(filePath)) {
+         fs.unlinkSync(filePath);
+      }
+      for (let i = 0; i < (totalChunks || 0); i++) {
+        const chunkPath = path.join(os.tmpdir(), `upload_${fileId}_part_${i}`);
+        if (!fs.existsSync(chunkPath)) {
+          throw new Error(`Missing chunk ${i}`);
+        }
+        const chunkData = fs.readFileSync(chunkPath);
+        fs.appendFileSync(filePath, chunkData);
+        fs.unlinkSync(chunkPath);
+      }
+      
+      if (!fs.existsSync(filePath)) {
+         throw new Error('File not found on server');
+      }
+
+      const currentAi = apiKey ? new GoogleGenAI({ apiKey }) : ai;
+      
+      let uploadPath = filePath;
+      let uploadMime = mimetype;
+      
+      const isVideo = mimetype.startsWith('video/') || mimetype === 'application/octet-stream' || mimetype === '';
+      
+      if (isVideo) {
+        console.log('Extracting audio from video to speed up upload...');
+        jobs.set(jobId, { status: 'extracting audio', progress: 42 });
+        const audioPath = path.join(os.tmpdir(), `audio_${fileId}.mp3`);
+        await execAsync(`ffmpeg -hide_banner -loglevel error -i "${filePath}" -vn -acodec libmp3lame -q:a 2 "${audioPath}" -y`);
+        uploadPath = audioPath;
+        uploadMime = 'audio/mpeg';
+      }
+
+      const activeModel = model || 'gemini-2.5-flash';
+      
+      if (activeModel === 'amazon') {
+         jobs.set(jobId, { status: 'uploading to s3', progress: 45 });
+         console.log(`Uploading file to S3... ${uploadPath}`);
+         
+         const region = reqAwsRegion || process.env.AWS_REGION || 'ap-southeast-2';
+         const bucket = reqAwsS3Bucket || process.env.AWS_S3_BUCKET || 'elasticbeanstalk-ap-southeast-2-824353504213';
+         
+         const awsConfig = {
+           region,
+           credentials: {
+             accessKeyId: reqAwsAccessKeyId || process.env.AWS_ACCESS_KEY_ID || '',
+             secretAccessKey: reqAwsSecretAccessKey || process.env.AWS_SECRET_ACCESS_KEY || ''
+           }
+         };
+         
+         if (!awsConfig.credentials.accessKeyId) {
+             throw new Error("ការកំណត់ AWS Credentials មិនទាន់បានបំពេញ (AWS_ACCESS_KEY_ID នៅក្នុងកូដម៉ាស៊ីន)។");
+         }
+         
+         const s3Client = new S3Client(awsConfig);
+         const transcribeClient = new TranscribeClient(awsConfig);
+         
+         const s3Key = `uploads/${jobId}_audio.mp3`;
+         const uploadStream = fs.createReadStream(uploadPath);
+         
+         await s3Client.send(new PutObjectCommand({
+             Bucket: bucket,
+             Key: s3Key,
+             Body: uploadStream
+         }));
+         
+         jobs.set(jobId, { status: 'transcribing with amazon', progress: 50 });
+         
+         const transcribeJobName = `TranscribeJob_${jobId}`;
+         await transcribeClient.send(new StartTranscriptionJobCommand({
+             TranscriptionJobName: transcribeJobName,
+             IdentifyLanguage: true,
+             MediaFormat: "mp3",
+             Media: { MediaFileUri: `s3://${bucket}/${s3Key}` },
+         }));
+         
+         let transcribeStatus = 'IN_PROGRESS';
+         let transcriptUri = '';
+         let retries = 0;
+         while (transcribeStatus === 'IN_PROGRESS' || transcribeStatus === 'QUEUED') {
+             await new Promise(r => setTimeout(r, 5000));
+             const jobRes = await transcribeClient.send(new GetTranscriptionJobCommand({ TranscriptionJobName: transcribeJobName }));
+             transcribeStatus = jobRes.TranscriptionJob?.TranscriptionJobStatus || 'FAILED';
+             
+             if (transcribeStatus === 'COMPLETED') {
+                 transcriptUri = jobRes.TranscriptionJob?.Transcript?.TranscriptFileUri || '';
+                 break;
+             }
+             if (transcribeStatus === 'FAILED') {
+                 throw new Error("ការបកប្រែតាមរយៈ Amazon ទទួលបរាជ័យ: " + jobRes.TranscriptionJob?.FailureReason);
+             }
+             retries++;
+             jobs.set(jobId, { status: 'transcribing with amazon', progress: 50 + Math.min(retries * 2, 35) });
+         }
+         
+         jobs.set(jobId, { status: 'processing results', progress: 85 });
+         
+         const resultRes = await fetch(transcriptUri);
+         const resultJson: any = await resultRes.json();
+         
+         // Parse resultJson to {id, start, end, text}
+         const items = resultJson.results?.items || [];
+         let originalLines = [];
+         let currentLine = null;
+         
+         let wordCount = 0;
+         for (const item of items) {
+             if (item.type === 'pronunciation') {
+                 if (!currentLine) {
+                     currentLine = { id: Math.random().toString(), start: item.start_time, end: item.end_time, text: item.alternatives[0].content };
+                     wordCount = 1;
+                 } else {
+                     const gap = parseFloat(item.start_time) - parseFloat(currentLine.end);
+                     const duration = parseFloat(item.end_time) - parseFloat(currentLine.start);
+                     const isPunctuationEnding = currentLine.text.match(/[.!?]$/);
+                     
+                     // Tighter chunking for perfect lip sync:
+                     // 1. Pause > 0.5s
+                     // 2. Line duration > 3.5s (don't make sentences too long)
+                     // 3. Word count >= 10 words
+                     // 4. Sentence ended (punctuation) + slight pause
+                     if (gap > 0.5 || duration > 3.5 || wordCount >= 10 || (isPunctuationEnding && gap > 0.2)) {
+                         originalLines.push(currentLine);
+                         currentLine = { id: Math.random().toString(), start: item.start_time, end: item.end_time, text: item.alternatives[0].content };
+                         wordCount = 1;
+                     } else {
+                         currentLine.end = item.end_time;
+                         currentLine.text += " " + item.alternatives[0].content;
+                         wordCount++;
+                     }
+                 }
+             } else if (item.type === 'punctuation' && currentLine) {
+                 currentLine.text += item.alternatives[0].content;
+             }
+         }
+         if (currentLine) originalLines.push(currentLine);
+         
+         // Helper to convert float seconds to M:SS.S
+         const formatTimestamp = (secStr) => {
+             const secFloat = parseFloat(secStr);
+             const mins = Math.floor(secFloat / 60);
+             const secs = secFloat % 60;
+             return `${mins}:${secs.toFixed(1).padStart(4, '0')}`;
+         };
+         
+         originalLines = originalLines.map(line => ({
+             id: line.id,
+             start: formatTimestamp(line.start),
+             end: formatTimestamp(line.end),
+             text: line.text
+         }));
+         
+         if (originalLines.length === 0) {
+             throw new Error("AWS Transcribe មិនអាចស្គាល់សំឡេងបានទេ (No speech detected). អាចដោយសារវីដេអូគ្មានសំឡេង ឬប្រើភាសាដែលប្រព័ន្ធមិនស្គាល់។");
+         }
+
+         jobs.set(jobId, { status: 'translating to khmer', progress: 90 });
+         console.log(`Translating ${originalLines.length} lines to Khmer...`);
+         
+         // Translate via Gemini in chunks
+         const CHUNK_SIZE = 40;
+         let translatedLines = [];
+         
+         for (let i = 0; i < originalLines.length; i += CHUNK_SIZE) {
+             const chunk = originalLines.slice(i, i + CHUNK_SIZE);
+             let chunkSuccess = false;
+             let generateRetries = 0;
+             
+             while (!chunkSuccess && generateRetries < 3) {
+                 try {
+                     const response = await currentAi.models.generateContent({
+                         model: 'gemini-2.5-flash',
+                         contents: [{
+                             role: 'user',
+                             parts: [
+                                 { text: 'You are a professional subtitle translator. Translate the "text" fields in the following JSON array from its original language into Khmer (Cambodian). Keep the exact same JSON structure, keep the "id", "start", and "end" fields exactly the same. Only translate the "text" field. Return ONLY a valid JSON array.\n\n' + JSON.stringify(chunk) }
+                             ]
+                         }],
+                         config: {
+                             responseMimeType: 'application/json',
+                         }
+                     });
+                     
+                     let responseText = response.text || '';
+                     const parsedChunk = JSON.parse(responseText.replace(/^\s*```json\s*/, '').replace(/\s*```\s*$/, ''));
+                     
+                     // Ensure no fields were dropped
+                     const validatedChunk = parsedChunk.map((item, index) => ({
+                         id: chunk[index].id,
+                         start: chunk[index].start,
+                         end: chunk[index].end,
+                         text: item.text || item.Text || chunk[index].text
+                     }));
+
+                     translatedLines.push(...validatedChunk);
+                     chunkSuccess = true;
+                 } catch (err) {
+                     console.error(`Translation chunk ${i} error:`, err.message);
+                     generateRetries++;
+                     if (generateRetries >= 3) throw new Error("Translation via Gemini failed after 3 attempts.");
+                     await new Promise(r => setTimeout(r, 3000));
+                 }
+             }
+             
+             const translateProgress = 90 + Math.floor((i / originalLines.length) * 10);
+             const percent = Math.floor(Math.min(100, ((i + CHUNK_SIZE) / originalLines.length) * 100));
+             jobs.set(jobId, { status: `translating (${percent}%)`, progress: Math.min(99, translateProgress) });
+         }
+         
+         // Cleanup S3
+         try {
+             await s3Client.send(new DeleteObjectCommand, ListObjectsV2Command({ Bucket: bucket, Key: s3Key }));
+         } catch(e) { console.error('Failed to cleanup S3', e); }
+         
+         if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+         if (uploadPath !== filePath && fs.existsSync(uploadPath)) fs.unlinkSync(uploadPath);
+         
+         jobs.set(jobId, { status: 'done', progress: 100, lines: translatedLines });
+         return; // Exit here for Amazon
+      }
+      
+      // Upload to Gemini
+      console.log(`Uploading file to Gemini... ${uploadPath}`);
+      jobs.set(jobId, { status: 'uploading to gemini', progress: 45 });
+      
+      const fileBuffer = fs.readFileSync(uploadPath);
+      const fileBlob = new Blob([fileBuffer]);
+      
+      const uploadResult = await currentAi.files.upload({ file: fileBlob, config: { mimeType: uploadMime } });
+      console.log(`Upload complete. Generating content...`);
+
+      // We may need to poll if it's a large video, but wait for active state
+      jobs.set(jobId, { status: 'processing video', progress: 50 });
+      let fileState = await currentAi.files.get({ name: uploadResult.name });
+      let retries = 0;
+      while (fileState.state === 'PROCESSING' && retries < 40) {
+        console.log('File is processing, waiting...');
+        await new Promise(r => setTimeout(r, 3000));
+        fileState = await currentAi.files.get({ name: uploadResult.name });
+        retries++;
+        jobs.set(jobId, { status: 'processing video', progress: 50 + Math.min(retries * 2, 20) });
+      }
+
+      if (fileState.state === 'FAILED') {
+        throw new Error('Video processing failed on Gemini side.');
+      }
+
+      jobs.set(jobId, { status: 'generating subtitles', progress: 75 });
+      let response;
+      let generateRetries = 0;
+      let generateSuccess = false;
+      let lastError;
+
+      while (!generateSuccess && generateRetries < 3) {
+        try {
+          if (generateRetries > 0) {
+            console.log(`Retrying generation (Attempt ${generateRetries + 1})...`);
+            jobs.set(jobId, { status: `retrying generation (${generateRetries}/3)`, progress: 75 });
+            await new Promise(resolve => setTimeout(resolve, 5000 * generateRetries)); // Exponential-ish backoff
+          }
+          
+          let activeModel = model || 'gemini-2.5-flash';
+          if (activeModel === 'gemini-3.6-flash') activeModel = 'gemini-2.5-flash';
+          
+          response = await currentAi.models.generateContent({
+            model: activeModel,
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  { text: 'You are a professional subtitle translator. You MUST transcribe and translate the ENTIRE audio into Khmer (Cambodian). DO NOT skip any dialogue. Pay close attention to the entire duration. ALL subtitle text MUST be in the Khmer language. Do NOT output the original language. Break the translation down into sequential subtitle lines with accurate start and end timestamps (M:SS.S). If the video is long, you must process as much as you can. Return ONLY a valid JSON array of objects with the schema: { id: string, start: string, end: string, text: string }. Do not output an empty array unless there is absolutely zero speech.' },
+                  { fileData: { fileUri: uploadResult.uri, mimeType: uploadMime } }
+                ]
+              }
+            ],
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.STRING },
+                    start: { type: Type.STRING },
+                    end: { type: Type.STRING },
+                    text: { type: Type.STRING }
+                  },
+                  required: ["id", "start", "end", "text"]
+                }
+              }
+            }
+          });
+          generateSuccess = true;
+        } catch (e: any) {
+          lastError = e;
+          console.error(`Generation error (Attempt ${generateRetries + 1}):`, e.message);
+          if (e.message?.includes('503') || e.message?.includes('429') || e.message?.includes('UNAVAILABLE') || e.message?.includes('RESOURCE_EXHAUSTED')) {
+            generateRetries++;
+          } else {
+            throw e; // Break loop for non-transient errors
+          }
+        }
+      }
+
+      if (!generateSuccess) {
+        throw lastError;
+      }
+
+      let responseText = response?.text || '';
+      responseText = responseText.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+      
+      let lines;
+      try {
+        lines = JSON.parse(responseText);
+      } catch (err) {
+        // Fallback: try to match array and fix truncation
+        const jsonMatch = responseText.match(/\[\s*\{[\s\S]*/);
+        if (jsonMatch) {
+          let fixedStr = jsonMatch[0];
+          const lastClose = fixedStr.lastIndexOf('}');
+          if (lastClose !== -1) {
+             fixedStr = fixedStr.substring(0, lastClose + 1) + ']';
+             try {
+                lines = JSON.parse(fixedStr);
+             } catch (e2) {
+                throw new Error('Could not parse JSON from Gemini response: ' + responseText);
+             }
+          } else {
+             throw new Error('Could not parse JSON from Gemini response: ' + responseText);
+          }
+        } else {
+          throw new Error('Could not parse JSON from Gemini response: ' + responseText);
+        }
+      }
+
+      if (lines.length === 0) {
+          throw new Error('ការបកប្រែទទួលបានអក្សរទទេ (0 lines) ពីប្រព័ន្ធ។ សូមសាកល្បងកាត់វីដេអូជាចំណែកខ្លីៗ។ Data: ' + responseText.substring(0, 100));
+      }
+      
+      // Clean up
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      if (uploadPath !== filePath && fs.existsSync(uploadPath)) fs.unlinkSync(uploadPath);
+      try {
+        await currentAi.files.delete({ name: uploadResult.name });
+      } catch(e) {
+        console.error('Failed to delete from Gemini', e);
+      }
+
+      jobs.set(jobId, { status: 'done', progress: 100, lines });
+    } catch (error: any) {
+      console.error('Transcription error:', error);
+      let errorMessage = error.message;
+      if (errorMessage?.includes('429') || errorMessage?.includes('Quota exceeded') || errorMessage?.includes('RESOURCE_EXHAUSTED')) {
+        errorMessage = 'ប្រព័ន្ធ AI របស់ Google កំពុងរវល់ ឬអស់ចំនួនប្រើប្រាស់ឥតគិតថ្លៃ។ សូមរង់ចាំប្រហែល 1 នាទីរួចសាកល្បងម្តងទៀត ឬបញ្ចូល API Key ផ្ទាល់ខ្លួនរបស់អ្នក។ (Rate Limit 429)';
+      } else if (errorMessage?.includes('503') || errorMessage?.includes('UNAVAILABLE') || errorMessage?.includes('high demand')) {
+        errorMessage = 'ប្រព័ន្ធ AI របស់ Google កំពុងមានអ្នកប្រើប្រាស់ច្រើន (High Demand/503) ធ្វើឱ្យការបកប្រែបរាជ័យ។ សូមរង់ចាំបន្តិចរួចចុចសាកល្បងម្តងទៀត។';
+      } else if (errorMessage?.includes('504') || errorMessage?.includes('DEADLINE_EXCEEDED')) {
+        errorMessage = 'វីដេអូវែងពេកធ្វើឱ្យការបកប្រែចំណាយពេលយូរហួសកំណត់ (Timeout)។ សូមសាកល្បងជាមួយវីដេអូខ្លីជាងនេះ ឬព្យាយាមម្តងទៀតនៅពេលក្រោយ។';
+      }
+      jobs.set(jobId, { status: 'error', progress: 0, error: errorMessage });
+    }
+  })();
+});
+
+app.post('/api/test-aws', async (req, res) => {
+    try {
+        const reqAwsAccessKeyId = req.headers['x-aws-access-key-id'] || '';
+        const reqAwsSecretAccessKey = req.headers['x-aws-secret-access-key'] || '';
+        const reqAwsRegion = req.headers['x-aws-region'] || 'ap-southeast-2';
+        const reqAwsS3Bucket = req.headers['x-aws-s3-bucket'] || '';
+
+        if (!reqAwsAccessKeyId || !reqAwsSecretAccessKey || !reqAwsS3Bucket) {
+            return res.status(400).json({ error: 'សូមបំពេញ AWS Keys និង S3 Bucket ឱ្យបានពេញលេញសិន' });
+        }
+
+        const awsConfig = {
+            region: reqAwsRegion,
+            credentials: {
+                accessKeyId: reqAwsAccessKeyId,
+                secretAccessKey: reqAwsSecretAccessKey
+            }
+        };
+
+        const s3Client = new S3Client(awsConfig);
+        
+        // Try to list objects in the bucket to test credentials and bucket access
+        const testCommand = new ListObjectsV2Command({ Bucket: reqAwsS3Bucket, MaxKeys: 1 });
+        await s3Client.send(testCommand);
+
+        res.json({ success: true, message: 'AWS Keys និង Bucket របស់អ្នកត្រឹមត្រូវ អាចប្រើបាន!' });
+    } catch (e) {
+        console.error('AWS Test Error:', e);
+        res.status(400).json({ error: 'បញ្ហាភ្ជាប់ទៅ AWS: ' + e.message });
+    }
+});
+
+app.get('/api/debug/jobs', (req, res) => {
+    const allJobs = {};
+    for (const [k, v] of jobs.entries()) {
+        allJobs[k] = { status: v.status, progress: v.progress, error: v.error, linesCount: v.lines ? v.lines.length : 0 };
+    }
+    res.json(allJobs);
+});
+
+app.get('/api/transcribe/status', (req, res) => {
+  const jobId = req.query.jobId as string;
+  const job = jobs.get(jobId);
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+  res.json(job);
+});
+
+app.post('/api/tts', async (req, res) => {
+  try {
+    const { text, voice } = req.body;
+    
+    // Fallbacks if not provided
+    const targetVoice = voice === 'Sreymom' ? 'km-KH-SreymomNeural' : 'km-KH-PisethNeural';
+    
+    const tts = new EdgeTTS({ voice: targetVoice, lang: 'km-KH' });
+    
+    const tempFile = path.join(os.tmpdir(), `tts_${Date.now()}.mp3`);
+    await tts.ttsPromise(text, tempFile);
+    
+    const audioBuffer = fs.readFileSync(tempFile);
+    fs.unlinkSync(tempFile);
+    
+    res.set('Content-Type', 'audio/mpeg');
+    res.send(audioBuffer);
+  } catch (error: any) {
+    console.error('TTS Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/export-video', upload.any(), async (req, res) => {
+  try {
+    const files = req.files as Express.Multer.File[] || [];
+    const srtFile = files.find(f => f.fieldname === 'srt');
+    
+    // Hash inputs for caching
+    const metadataStr = req.body.metadata || '';
+    const videoFileId = req.body.videoFileId || '';
+    const srtContent = srtFile && fs.existsSync(srtFile.path) ? fs.readFileSync(srtFile.path, 'utf8') : '';
+    
+const hash = crypto.createHash('sha256');
+    hash.update(videoFileId);
+    hash.update(metadataStr);
+    hash.update(srtContent);
+    // Include audio file sizes to detect if an audio file was regenerated
+    const audioFilesForHash = files.filter(f => f.fieldname.startsWith('audio_'));
+    audioFilesForHash.sort((a, b) => a.fieldname.localeCompare(b.fieldname));
+    for (const af of audioFilesForHash) {
+        if (fs.existsSync(af.path)) {
+            hash.update(fs.statSync(af.path).size.toString());
+        }
+    }
+    const exportKey = hash.digest('hex');
+    
+    if (exportCache.has(exportKey)) {
+        const existingJobId = exportCache.get(exportKey);
+        const job = exportJobs.get(existingJobId!);
+        if (job && (job.status === 'completed' || job.status === 'processing') && job.path && fs.existsSync(job.path)) {
+            // Cleanup incoming files since we are using cache
+            files.forEach(f => {
+              try { fs.unlinkSync(f.path); } catch (e) {}
+            });
+            // Cleanup incoming chunks
+            const videoTotalChunks = parseInt(req.body.videoTotalChunks || '0', 10);
+            for (let i = 0; i < videoTotalChunks; i++) {
+              const chunkPath = path.join(os.tmpdir(), `upload_${videoFileId}_part_${i}`);
+              if (fs.existsSync(chunkPath)) fs.unlinkSync(chunkPath);
+            }
+            return res.json({ jobId: existingJobId, cached: true });
+        }
+    }
+    let videoPath = '';
+    const videoTotalChunks = parseInt(req.body.videoTotalChunks || '0', 10);
+    
+    if (videoFileId && videoTotalChunks > 0) {
+      videoPath = path.join(os.tmpdir(), `upload_${videoFileId}`);
+      if (fs.existsSync(videoPath)) {
+        fs.unlinkSync(videoPath);
+      }
+      for (let i = 0; i < videoTotalChunks; i++) {
+        const chunkPath = path.join(os.tmpdir(), `upload_${videoFileId}_part_${i}`);
+        if (!fs.existsSync(chunkPath)) {
+          throw new Error(`Missing chunk ${i} for export`);
+        }
+        const chunkData = fs.readFileSync(chunkPath);
+        fs.appendFileSync(videoPath, chunkData);
+        fs.unlinkSync(chunkPath);
+      }
+    } else {
+      const videoFile = files.find(f => f.fieldname === 'video');
+      if (videoFile) {
+        videoPath = videoFile.path;
+      } else {
+        throw new Error('Missing video file');
+      }
+    }
+    
+    let audioMetadata: any[] = [];
+    if (metadataStr) {
+      audioMetadata = JSON.parse(metadataStr);
+    }
+    
+    const jobId = Date.now().toString();
+    exportCache.set(exportKey, jobId);
+    const outputVideoPath = path.join(os.tmpdir(), `output_${jobId}.mp4`);
+    
+    exportJobs.set(jobId, { status: 'processing' });
+    res.json({ jobId });
+    
+    // Process in background
+    (async () => {
+      let currentCmd = '';
+      try {
+        let hasOriginalAudio = false;
+        try {
+          currentCmd = `ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "${videoPath}"`;
+          const { stdout } = await execAsync(currentCmd);
+          if (stdout.trim().length > 0) hasOriginalAudio = true;
+        } catch(e) {
+          logFfmpegDiagnostic('ffprobe (check original audio)', currentCmd, e, e.stderr, e.stdout);
+        }
+        
+                let finalMapA = '';
+        const tempMixedAudio = path.join(os.tmpdir(), `mixed_${jobId}.m4a`);
+        const audioFiles = files.filter(f => f.fieldname.startsWith('audio_') && fs.statSync(f.path).size > 100);
+        
+        // STEP 1: Mix audio if needed
+        if (audioFiles.length > 0) {
+           let mixCmd = `ffmpeg -nostdin -hide_banner -loglevel error`;
+           let audioFilter = '';
+           let mixInputs = '';
+           let inputCount = audioFiles.length;
+           
+           if (hasOriginalAudio) {
+               mixCmd += ` -i "${videoPath}"`;
+               audioFilter += `[0:a]volume=0.1[a0]; `;
+               mixInputs += `[a0]`;
+               inputCount += 1;
+           }
+           
+           for (let i = 0; i < audioFiles.length; i++) {
+              mixCmd += ` -i "${audioFiles[i].path}"`;
+              const af = audioFiles[i];
+              const meta = audioMetadata.find(m => m.key === af.fieldname);
+              let delayMs = 0;
+              if (meta && meta.start) {
+                const parts = meta.start.split(':');
+                let totalSeconds = 0;
+                if (parts.length === 3) {
+                   totalSeconds = parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseFloat(parts[2].replace(',', '.'));
+                } else if (parts.length === 2) {
+                   totalSeconds = parseInt(parts[0]) * 60 + parseFloat(parts[1].replace(',', '.'));
+                }
+                delayMs = Math.round(totalSeconds * 1000);
+              }
+              const inputIndex = hasOriginalAudio ? i + 1 : i;
+              audioFilter += `[${inputIndex}:a]adelay=${delayMs}|${delayMs}[a${inputIndex}]; `;
+              mixInputs += `[a${inputIndex}]`;
+           }
+           
+           if (inputCount === 1) { 
+               audioFilter += `${mixInputs}volume=1[aout]`; 
+           } else { 
+               audioFilter += `${mixInputs}amix=inputs=${inputCount}:duration=longest:normalize=0[aout]`; 
+           }
+           
+           mixCmd += ` -filter_complex "${audioFilter}" -map "[aout]" -c:a aac -b:a 192k -y "${tempMixedAudio}"`;
+           console.log('Running FFmpeg audio mix:', mixCmd);
+           let mixResult;
+           try {
+               currentCmd = mixCmd;
+               mixResult = await execAsync(mixCmd);
+               if (mixResult.stderr) logFfmpegDiagnostic('ffmpeg (audio mix warning)', mixCmd, null, mixResult.stderr, mixResult.stdout);
+           } catch(e) {
+               logFfmpegDiagnostic('ffmpeg (audio mix failure)', mixCmd, e, e.stderr, e.stdout);
+               throw new Error('FFmpeg mix error: ' + (e.stderr || e.message).substring(0, 500));
+           }
+           
+           finalMapA = '1:a';
+        } else if (hasOriginalAudio) {
+           finalMapA = '0:a';
+        }
+        
+        // STEP 2: Encode Video and add Subtitles
+        let needsVideoReencode = false;
+        let vFilter = '';
+        let mapV = '0:v';
+        
+        if (srtFile) {
+           const escapedSrtPath = srtFile.path.replace(/\\/g, '/').replace(/'/g, "\\\'").replace(/:/g, "\\:");
+           vFilter = `subtitles='${escapedSrtPath}'`;
+           mapV = `[vout]`;
+           needsVideoReencode = true;
+        }
+        
+        let videoCmd = `ffmpeg -nostdin -hide_banner -loglevel error -i "${videoPath}"`;
+        if (audioFiles.length > 0) {
+            videoCmd += ` -i "${tempMixedAudio}"`;
+        }
+        
+        if (vFilter) {
+            videoCmd += ` -filter_complex "${vFilter}[vout]"`;
+        }
+        
+        videoCmd += ` -map "${mapV}"`;
+        if (finalMapA) {
+            videoCmd += ` -map "${finalMapA}"`;
+        }
+        
+        if (needsVideoReencode) {
+           videoCmd += ` -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p`;
+        } else {
+           videoCmd += ` -c:v copy`;
+        }
+        
+        if (audioFiles.length > 0 || hasOriginalAudio) {
+           videoCmd += ` -c:a aac -b:a 192k`;
+        }
+        
+        videoCmd += ` -y "${outputVideoPath}"`;
+        
+
+        console.log('Running FFmpeg video export:', videoCmd);
+        const tempOutputVideoPath = path.join(os.tmpdir(), `.final_${jobId}.tmp.mp4`);
+        videoCmd = videoCmd.replace(`"${outputVideoPath}"`, `"${tempOutputVideoPath}"`);
+        
+        exportJobs.set(jobId, { status: 'processing', progress: 10 });
+        
+        await new Promise((resolve, reject) => {
+            
+            // use shell for easier parsing of the command
+            const child = spawn(videoCmd, { shell: true });
+            
+            child.stderr.on('data', (data) => {
+                const str = data.toString();
+                if (str.includes('time=')) {
+                    // Try to extract time=HH:MM:SS.ms
+                    const match = str.match(/time=(\d+):(\d+):(\d+\.\d+)/);
+                    if (match) {
+                        exportJobs.set(jobId, { status: 'processing', progress: 50 });
+                    }
+                }
+            });
+            
+            child.on('close', (code) => {
+                if (code === 0) resolve(true);
+                else reject(new Error('FFmpeg exited with code ' + code));
+            });
+            child.on('error', reject);
+        });
+
+        exportJobs.set(jobId, { status: 'processing', progress: 90 });
+        
+        // Validate with ffprobe
+        currentCmd = `ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1:nokey=1 "${tempOutputVideoPath}"`;
+        try {
+          const { stdout: probeOut } = await execAsync(currentCmd);
+          const [duration, size] = probeOut.trim().split('\n').map(Number);
+          
+          if (!duration || duration <= 0 || !size || size <= 0) {
+              throw new Error('Export validation failed: invalid duration or size');
+          }
+        } catch (e) {
+          logFfmpegDiagnostic('ffprobe (validate output)', currentCmd, e, e.stderr, e.stdout);
+          throw e;
+        }
+        
+        fs.renameSync(tempOutputVideoPath, outputVideoPath);
+        exportJobs.set(jobId, { status: 'completed', path: outputVideoPath, progress: 100 });
+
+        
+      } catch (err: any) {
+        logFfmpegDiagnostic('ffmpeg (video export or overall failure)', currentCmd, err, err.stderr, err.stdout);
+        exportJobs.set(jobId, { status: 'error', error: `FFMPEG_ERROR: ${err.stderr ? err.stderr.toString().substring(0, 200) : err.message}` });
+        
+        // Try cleanup
+        files.forEach(f => {
+          try { fs.unlinkSync(f.path); } catch (e) {}
+        });
+        if (videoFileId) {
+          try { fs.unlinkSync(videoPath); } catch (e) {}
+        }
+      }
+    })();
+  } catch (err: any) {
+    console.error('Export upload error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/export/status/:jobId', async (req, res) => {
+  const jobId = req.params.jobId;
+  let job = exportJobs.get(jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  
+  // Long polling: Keep the request open to prevent Cloud Run from throttling CPU
+  // during FFmpeg background processing.
+  let retries = 0;
+  while (job.status === 'processing' && retries < 15) {
+    await new Promise(r => setTimeout(r, 1000));
+    job = exportJobs.get(jobId);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    retries++;
+  }
+  
+  res.json(job);
+});
+
+app.get('/api/export/download/:jobId', (req, res) => {
+  const job = exportJobs.get(req.params.jobId);
+  if (!job || !job.path || !fs.existsSync(job.path)) {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(404).send(`
+      <script>
+        alert("រកមិនឃើញឯកសារវីដេអូទេ។ សូមសាកល្បង Export ម្តងទៀត។ (File not found, server restarted)");
+        window.close();
+      </script>
+    `);
+  }
+  const filename = (req.query.filename as string) || 'exported_video.mp4';
+  res.sendFile(job.path, (err) => {
+    // We intentionally don't delete immediately to allow multiple downloads/retries.
+  });
+});
+
+// Vite middleware for development
+async function startServer() {
+  if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+startServer();
