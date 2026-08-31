@@ -2,7 +2,6 @@ import * as dotenv from 'dotenv';
 dotenv.config();
 import { S3Client, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { TranscribeClient, StartTranscriptionJobCommand, GetTranscriptionJobCommand } from "@aws-sdk/client-transcribe";
-import fetch from "node-fetch";
 import express from 'express';
 import * as crypto from 'crypto';
 import path from 'path';
@@ -42,7 +41,8 @@ app.use(express.urlencoded({ extended: true, limit: '500mb' }));
 
 const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 500 * 1024 * 1024 } });
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const defaultGeminiKey = process.env.GEMINI_API_KEY;
+const ai = defaultGeminiKey ? new GoogleGenAI({ apiKey: defaultGeminiKey }) : null;
 
 app.post('/api/upload-chunk', express.raw({ type: '*/*', limit: '500mb' }), async (req, res) => {
   try {
@@ -100,7 +100,15 @@ app.post('/api/transcribe/start', async (req, res) => {
          throw new Error('File not found on server');
       }
 
-      const currentAi = apiKey ? new GoogleGenAI({ apiKey }) : ai;
+      const currentAi = apiKey
+          ? new GoogleGenAI({ apiKey })
+          : ai;
+
+        if (!currentAi) {
+          throw new Error(
+            'Gemini API Key មិនត្រូវបានកំណត់។ សូមបញ្ចូល Gemini API Key ក្នុង App Settings។'
+          );
+        }
       
       let uploadPath = filePath;
       let uploadMime = mimetype;
@@ -117,7 +125,378 @@ app.post('/api/transcribe/start', async (req, res) => {
       }
 
       const activeModel = model || 'gemini-2.5-flash';
+
+/*
+ * QWEN KHMER ASR
+ * Qwen runs separately in ~/qwen-asr
+ */
+const QWEN_ASR_URL =
+  process.env.QWEN_ASR_URL || 'http://127.0.0.1:8000/transcribe';
+
+async function transcribeWithQwen(
+  audioPath: string,
+  filename = 'audio.mp3'
+): Promise<string> {
+
+  console.log('[QWEN ASR] Sending audio to:', QWEN_ASR_URL);
+
+  const audioBuffer = fs.readFileSync(audioPath);
+
+  const form = new FormData();
+
+  const blob = new Blob([audioBuffer], {
+    type: 'audio/mpeg'
+  });
+
+  form.append('file', blob, filename);
+
+  const response = await fetch(QWEN_ASR_URL, {
+    method: 'POST',
+    body: form
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+
+    throw new Error(
+      'Qwen ASR failed (' +
+      response.status +
+      '): ' +
+      errorText
+    );
+  }
+
+  const result: any = await response.json();
+
+  if (!result.text || !result.text.trim()) {
+    throw new Error('Qwen ASR returned empty transcript.');
+  }
+
+  console.log(
+    '[QWEN ASR] Transcript length:',
+    result.text.length
+  );
+
+  return result.text.trim();
+}
+
       
+      /*
+       * ============================================================
+       * QWEN KHMER ASR PIPELINE
+       * ============================================================
+       *
+       * Video
+       *   ↓
+       * FFmpeg → MP3
+       *   ↓
+       * Qwen Khmer ASR
+       *   ↓
+       * Gemini corrects the raw transcript
+       *   ↓
+       * Gemini creates Khmer subtitle lines + timestamps
+       *
+       * Qwen ASR is running separately in:
+       *   ~/qwen-asr
+       *
+       * FastAPI:
+       *   http://127.0.0.1:8000/transcribe
+       */
+      if (activeModel === 'qwen-khmer') {
+        try {
+          jobs.set(jobId, {
+            status: 'transcribing with Qwen Khmer ASR',
+            progress: 50
+          });
+
+          console.log('[QWEN] Starting Khmer ASR...');
+          console.log('[QWEN] Audio:', uploadPath);
+
+          // Send extracted MP3 to local Qwen ASR server.
+          const rawTranscript = await transcribeWithQwen(
+            uploadPath,
+            path.basename(uploadPath)
+          );
+
+          console.log(
+            '[QWEN] Raw transcript:',
+            rawTranscript.substring(0, 500)
+          );
+
+          jobs.set(jobId, {
+            status: 'correcting transcript with Gemini',
+            progress: 65
+          });
+
+          /*
+           * IMPORTANT:
+           * Qwen is used as the primary ASR.
+           *
+           * Gemini receives the Qwen transcript and corrects
+           * obvious recognition errors using the audio as context.
+           *
+           * We then ask Gemini to create subtitle timestamps.
+           */
+          const correctionPrompt = `
+You are a professional Khmer subtitle editor.
+
+The transcript below was produced by a Khmer ASR model.
+
+Your job:
+1. Correct obvious ASR recognition mistakes.
+2. Preserve the actual meaning and spoken words.
+3. Do NOT invent dialogue.
+4. Do NOT translate yet.
+5. Keep Khmer words natural and readable.
+6. Remove obvious repeated hallucinations caused by ASR.
+7. Return ONLY the corrected Khmer transcript as plain text.
+
+QWEN ASR TRANSCRIPT:
+${rawTranscript}
+`;
+
+          const correctionResponse =
+            await currentAi.models.generateContent({
+              model: 'gemini-2.5-flash',
+              contents: [{
+                role: 'user',
+                parts: [
+                  { text: correctionPrompt }
+                ]
+              }]
+            });
+
+          const correctedTranscript =
+            (correctionResponse.text || '').trim();
+
+          if (!correctedTranscript) {
+            throw new Error(
+              'Gemini returned an empty corrected transcript.'
+            );
+          }
+
+          console.log(
+            '[QWEN] Corrected transcript length:',
+            correctedTranscript.length
+          );
+
+          jobs.set(jobId, {
+            status: 'creating Khmer subtitles',
+            progress: 75
+          });
+
+          /*
+           * Gemini now creates subtitle lines.
+           *
+           * The Qwen transcript is treated as the source text.
+           * Gemini should NOT perform a second independent
+           * transcription.
+           */
+          const subtitlePrompt = `
+You are a professional Khmer subtitle editor.
+
+Create Khmer subtitles for the supplied audio.
+
+IMPORTANT:
+- The Qwen ASR transcript below is the PRIMARY transcript.
+- Use it as the source of spoken content.
+- Do NOT invent words.
+- Do NOT omit spoken dialogue.
+- Keep the Khmer meaning faithful.
+- Split naturally into short subtitle lines.
+- Each line must have accurate start/end timestamps.
+- Timestamp format MUST be M:SS.S
+- Return ONLY valid JSON.
+- Schema:
+  [
+    {
+      "id": "string",
+      "start": "M:SS.S",
+      "end": "M:SS.S",
+      "text": "Khmer subtitle"
+    }
+  ]
+
+CORRECTED QWEN TRANSCRIPT:
+${correctedTranscript}
+`;
+
+          /*
+           * Upload the audio to Gemini only for timing/context.
+           * Gemini must follow the corrected Qwen transcript.
+           */
+          const qwenAudioBuffer = fs.readFileSync(uploadPath);
+          const qwenAudioBlob = new Blob([qwenAudioBuffer]);
+
+          const qwenGeminiUpload =
+            await currentAi.files.upload({
+              file: qwenAudioBlob,
+              config: { mimeType: uploadMime }
+            });
+
+          let qwenFileState =
+            await currentAi.files.get({
+              name: qwenGeminiUpload.name
+            });
+
+          let qwenFileRetries = 0;
+
+          while (
+            qwenFileState.state === 'PROCESSING' &&
+            qwenFileRetries < 40
+          ) {
+            await new Promise(r => setTimeout(r, 3000));
+
+            qwenFileState =
+              await currentAi.files.get({
+                name: qwenGeminiUpload.name
+              });
+
+            qwenFileRetries++;
+          }
+
+          if (qwenFileState.state === 'FAILED') {
+            throw new Error(
+              'Gemini audio processing failed while creating timestamps.'
+            );
+          }
+
+          const subtitleResponse =
+            await currentAi.models.generateContent({
+              model: 'gemini-2.5-flash',
+              contents: [{
+                role: 'user',
+                parts: [
+                  { text: subtitlePrompt },
+                  {
+                    fileData: {
+                      fileUri: qwenGeminiUpload.uri,
+                      mimeType: uploadMime
+                    }
+                  }
+                ]
+              }],
+              config: {
+                responseMimeType: 'application/json',
+                responseSchema: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      id: { type: Type.STRING },
+                      start: { type: Type.STRING },
+                      end: { type: Type.STRING },
+                      text: { type: Type.STRING }
+                    },
+                    required: [
+                      "id",
+                      "start",
+                      "end",
+                      "text"
+                    ]
+                  }
+                }
+              }
+            });
+
+          let qwenResponseText =
+            subtitleResponse.text || '';
+
+          qwenResponseText = qwenResponseText
+            .replace(/^\s*```json\s*/, '')
+            .replace(/\s*```\s*$/, '')
+            .trim();
+
+          let qwenLines;
+
+          try {
+            qwenLines = JSON.parse(qwenResponseText);
+          } catch (parseError) {
+            throw new Error(
+              'Could not parse subtitle JSON from Gemini: ' +
+              qwenResponseText.substring(0, 500)
+            );
+          }
+
+          if (
+            !Array.isArray(qwenLines) ||
+            qwenLines.length === 0
+          ) {
+            throw new Error(
+              'Qwen/Gemini subtitle generation returned 0 lines.'
+            );
+          }
+
+          /*
+           * Ensure every line has the expected structure.
+           */
+          qwenLines = qwenLines
+            .filter((line: any) =>
+              line &&
+              typeof line.text === 'string' &&
+              line.text.trim()
+            )
+            .map((line: any, index: number) => ({
+              id: String(
+                line.id || `${jobId}-qwen-${index + 1}`
+              ),
+              start: String(line.start || '0:00.0'),
+              end: String(line.end || line.start || '0:00.0'),
+              text: String(line.text).trim()
+            }));
+
+          if (qwenLines.length === 0) {
+            throw new Error(
+              'No valid subtitle lines were generated from Qwen transcript.'
+            );
+          }
+
+          try {
+            await currentAi.files.delete({
+              name: qwenGeminiUpload.name
+            });
+          } catch (cleanupError) {
+            console.error(
+              '[QWEN] Failed to delete Gemini audio:',
+              cleanupError
+            );
+          }
+
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+          }
+
+          if (
+            uploadPath !== filePath &&
+            fs.existsSync(uploadPath)
+          ) {
+            fs.unlinkSync(uploadPath);
+          }
+
+          jobs.set(jobId, {
+            status: 'done',
+            progress: 100,
+            lines: qwenLines
+          });
+
+          console.log(
+            `[QWEN] Completed successfully: ${qwenLines.length} subtitle lines`
+          );
+
+          return;
+        } catch (qwenError: any) {
+          console.error(
+            '[QWEN ASR ERROR]',
+            qwenError
+          );
+
+          throw new Error(
+            'Qwen Khmer ASR failed: ' +
+            (qwenError?.message || qwenError)
+          );
+        }
+      }
+
       if (activeModel === 'amazon') {
          jobs.set(jobId, { status: 'uploading to s3', progress: 45 });
          console.log(`Uploading file to S3... ${uploadPath}`);
@@ -267,15 +646,36 @@ app.post('/api/transcribe/start', async (req, res) => {
                      });
                      
                      let responseText = response.text || '';
-                     const parsedChunk = JSON.parse(responseText.replace(/^\s*```json\s*/, '').replace(/\s*```\s*$/, ''));
-                     
-                     // Ensure no fields were dropped
-                     const validatedChunk = parsedChunk.map((item, index) => ({
-                         id: chunk[index].id,
-                         start: chunk[index].start,
-                         end: chunk[index].end,
-                         text: item.text || item.Text || chunk[index].text
-                     }));
+                     const cleanedResponse = responseText.trim();
+                      const parsedChunk = JSON.parse(cleanedResponse);
+
+                      if (!Array.isArray(parsedChunk)) {
+                        throw new Error("Gemini translation response is not an array.");
+                      }
+
+                      if (parsedChunk.length != chunk.length) {
+                        throw new Error(`Gemini returned ${parsedChunk.length} lines, expected ${chunk.length}.`);
+                      }
+
+                      const validatedChunk = chunk.map((originalLine, index) => {
+                        const translated = parsedChunk[index];
+                        const translatedText = typeof translated?.text === "string"
+                          ? translated.text.trim()
+                          : typeof translated?.Text === "string"
+                            ? translated.Text.trim()
+                            : "";
+
+                        if (!translatedText) {
+                          throw new Error(`Empty translation at index ${index}.`);
+                        }
+
+                        return {
+                          id: originalLine.id,
+                          start: originalLine.start,
+                          end: originalLine.end,
+                          text: translatedText
+                        };
+                      });
 
                      translatedLines.push(...validatedChunk);
                      chunkSuccess = true;
@@ -294,7 +694,7 @@ app.post('/api/transcribe/start', async (req, res) => {
          
          // Cleanup S3
          try {
-             await s3Client.send(new DeleteObjectCommand, ListObjectsV2Command({ Bucket: bucket, Key: s3Key }));
+             await s3Client.send(new DeleteObjectCommand({ Bucket: bucket, Key: s3Key }));
          } catch(e) { console.error('Failed to cleanup S3', e); }
          
          if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
@@ -449,10 +849,10 @@ app.post('/api/transcribe/start', async (req, res) => {
 
 app.post('/api/test-aws', async (req, res) => {
     try {
-        const reqAwsAccessKeyId = req.headers['x-aws-access-key-id'] || '';
-        const reqAwsSecretAccessKey = req.headers['x-aws-secret-access-key'] || '';
-        const reqAwsRegion = req.headers['x-aws-region'] || 'ap-southeast-2';
-        const reqAwsS3Bucket = req.headers['x-aws-s3-bucket'] || '';
+        const reqAwsAccessKeyId = typeof req.headers['x-aws-access-key-id'] === 'string' ? req.headers['x-aws-access-key-id'] : '';
+        const reqAwsSecretAccessKey = typeof req.headers['x-aws-secret-access-key'] === 'string' ? req.headers['x-aws-secret-access-key'] : '';
+        const reqAwsRegion = typeof req.headers['x-aws-region'] === 'string' ? req.headers['x-aws-region'] : 'ap-southeast-2';
+        const reqAwsS3Bucket = typeof req.headers['x-aws-s3-bucket'] === 'string' ? req.headers['x-aws-s3-bucket'] : '';
 
         if (!reqAwsAccessKeyId || !reqAwsSecretAccessKey || !reqAwsS3Bucket) {
             return res.status(400).json({ error: 'សូមបំពេញ AWS Keys និង S3 Bucket ឱ្យបានពេញលេញសិន' });
@@ -667,30 +1067,22 @@ const hash = crypto.createHash('sha256');
                throw new Error('FFmpeg mix error: ' + (e.stderr || e.message).substring(0, 500));
            }
            
-           finalMapA = '1:a';
+           finalMapA = hasOriginalAudio ? '1:a' : '0:a';
         } else if (hasOriginalAudio) {
            finalMapA = '0:a';
         }
-        
-        // STEP 2: Encode Video and add Subtitles
-        let needsVideoReencode = false;
-        let vFilter = '';
-        let mapV = '0:v';
-        
-        if (srtFile) {
-           const escapedSrtPath = srtFile.path.replace(/\\/g, '/').replace(/'/g, "\\\'").replace(/:/g, "\\:");
-           vFilter = `subtitles='${escapedSrtPath}'`;
-           mapV = `[vout]`;
-           needsVideoReencode = true;
-        }
-        
-        let videoCmd = `ffmpeg -nostdin -hide_banner -loglevel error -i "${videoPath}"`;
+        // STEP 2: Export Video WITHOUT burned-in subtitles
+let needsVideoReencode = false;
+let vFilter = '';
+let mapV = '0:v';
+
+
+        let videoCmd = `ffmpeg -nostdin -hide_banner -loglevel info -i "${videoPath}"`;
         if (audioFiles.length > 0) {
             videoCmd += ` -i "${tempMixedAudio}"`;
         }
         
         if (vFilter) {
-            videoCmd += ` -filter_complex "${vFilter}[vout]"`;
         }
         
         videoCmd += ` -map "${mapV}"`;
@@ -715,32 +1107,84 @@ const hash = crypto.createHash('sha256');
         const tempOutputVideoPath = path.join(os.tmpdir(), `.final_${jobId}.tmp.mp4`);
         videoCmd = videoCmd.replace(`"${outputVideoPath}"`, `"${tempOutputVideoPath}"`);
         
-        exportJobs.set(jobId, { status: 'processing', progress: 10 });
-        
+        // Export progress: 50% -> 90% based on real FFmpeg time.
+        // Progress is monotonic and can never move backwards.
+        exportJobs.set(jobId, { status: 'processing', progress: 50 });
+
+        let exportDuration = 0;
+        try {
+            const durationCmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`;
+            const { stdout: durationOut } = await execAsync(durationCmd);
+            exportDuration = Number(durationOut.trim()) || 0;
+        } catch (e) {
+            exportDuration = 0;
+        }
+
+        let lastExportProgress = 50;
+
         await new Promise((resolve, reject) => {
-            
-            // use shell for easier parsing of the command
             const child = spawn(videoCmd, { shell: true });
-            
+
+            let ffmpegOutputBuffer = '';
+
             child.stderr.on('data', (data) => {
-                const str = data.toString();
-                if (str.includes('time=')) {
-                    // Try to extract time=HH:MM:SS.ms
-                    const match = str.match(/time=(\d+):(\d+):(\d+\.\d+)/);
-                    if (match) {
-                        exportJobs.set(jobId, { status: 'processing', progress: 50 });
+                ffmpegOutputBuffer += data.toString();
+
+                // Keep a bounded buffer so partial stderr chunks are handled safely.
+                if (ffmpegOutputBuffer.length > 20000) {
+                    ffmpegOutputBuffer = ffmpegOutputBuffer.slice(-10000);
+                }
+
+                // Find the latest FFmpeg time=HH:MM:SS.xx value.
+                const matches = [
+                    ...ffmpegOutputBuffer.matchAll(/time=(\d+):(\d+):(\d+\.\d+)/g)
+                ];
+
+                if (matches.length > 0 && exportDuration > 0) {
+                    const match = matches[matches.length - 1];
+
+                    const currentTime =
+                        Number(match[1]) * 3600 +
+                        Number(match[2]) * 60 +
+                        Number(match[3]);
+
+                    const ffmpegPercent = Math.min(
+                        100,
+                        (currentTime / exportDuration) * 100
+                    );
+
+                    // Map FFmpeg 0-100% to UI 50-90%.
+                    const calculatedProgress = Math.min(
+                        90,
+                        50 + Math.floor(ffmpegPercent * 0.40)
+                    );
+
+                    // Progress must NEVER move backwards.
+                    if (calculatedProgress > lastExportProgress) {
+                        lastExportProgress = calculatedProgress;
+
+                        exportJobs.set(jobId, {
+                            status: 'processing',
+                            progress: calculatedProgress
+                        });
                     }
                 }
             });
-            
+
             child.on('close', (code) => {
-                if (code === 0) resolve(true);
-                else reject(new Error('FFmpeg exited with code ' + code));
+                if (code === 0) {
+                    exportJobs.set(jobId, {
+                        status: 'processing',
+                        progress: 90
+                    });
+                    resolve(true);
+                } else {
+                    reject(new Error('FFmpeg exited with code ' + code));
+                }
             });
+
             child.on('error', reject);
         });
-
-        exportJobs.set(jobId, { status: 'processing', progress: 90 });
         
         // Validate with ffprobe
         currentCmd = `ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1:nokey=1 "${tempOutputVideoPath}"`;
