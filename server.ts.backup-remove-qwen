@@ -307,13 +307,367 @@ app.post('/api/transcribe/start', async (req, res) => {
 
     const activeGeminiModel =
       model &&
-      !['amazon'].includes(model)
+      !['amazon', 'qwen-khmer'].includes(model)
         ? model
         : 'gemini-2.5-flash';
 
     const activeModel = activeWorkflow;
 
-if (activeModel === 'amazon') {
+/*
+ * QWEN KHMER ASR
+ * Qwen runs separately in ~/qwen-asr
+ */
+const QWEN_ASR_URL =
+  process.env.QWEN_ASR_URL || 'http://127.0.0.1:8000/transcribe';
+
+async function transcribeWithQwen(
+  audioPath: string,
+  filename = 'audio.mp3'
+): Promise<string> {
+
+  console.log('[QWEN ASR] Sending audio to:', QWEN_ASR_URL);
+
+  const audioBuffer = fs.readFileSync(audioPath);
+
+  const form = new FormData();
+
+  const blob = new Blob([audioBuffer], {
+    type: 'audio/mpeg'
+  });
+
+  form.append('file', blob, filename);
+
+  const response = await fetch(QWEN_ASR_URL, {
+    method: 'POST',
+    body: form
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+
+    throw new Error(
+      'Qwen ASR failed (' +
+      response.status +
+      '): ' +
+      errorText
+    );
+  }
+
+  const result: any = await response.json();
+
+  if (!result.text || !result.text.trim()) {
+    throw new Error('Qwen ASR returned empty transcript.');
+  }
+
+  console.log(
+    '[QWEN ASR] Transcript length:',
+    result.text.length
+  );
+
+  return result.text.trim();
+}
+
+      
+      /*
+       * ============================================================
+       * QWEN KHMER ASR PIPELINE
+       * ============================================================
+       *
+       * Video
+       *   ↓
+       * FFmpeg → MP3
+       *   ↓
+       * Qwen Khmer ASR
+       *   ↓
+       * Gemini corrects the raw transcript
+       *   ↓
+       * Gemini creates Khmer subtitle lines + timestamps
+       *
+       * Qwen ASR is running separately in:
+       *   ~/qwen-asr
+       *
+       * FastAPI:
+       *   http://127.0.0.1:8000/transcribe
+       */
+      if (activeModel === 'qwen-khmer') {
+    try {
+      jobs.set(jobId, {
+        status: 'transcribing with Qwen Khmer ASR',
+        progress: 50
+      });
+
+      console.log('[QWEN] Starting Khmer ASR...');
+      console.log('[QWEN] Audio:', uploadPath);
+
+      // ========================================================
+      // STEP 1: QWEN ASR
+      // ========================================================
+
+      const rawTranscript = await transcribeWithQwen(
+        uploadPath,
+        path.basename(uploadPath)
+      );
+
+      if (!rawTranscript || !rawTranscript.trim()) {
+        throw new Error('Qwen ASR returned an empty transcript.');
+      }
+
+      console.log(
+        '[QWEN] Raw transcript:',
+        rawTranscript.substring(0, 500)
+      );
+
+      // ========================================================
+      // STEP 2: GEMINI CREATES SOURCE SRT ONLY
+      // ========================================================
+      // Gemini is NOT allowed to translate here.
+      // It only uses Qwen transcript + audio to create
+      // accurate subtitle segmentation and timestamps.
+      // ========================================================
+
+      jobs.set(jobId, {
+        status: 'creating Qwen source subtitles',
+        progress: 65
+      });
+
+      const sourceSubtitlePrompt = `
+You are a professional subtitle timing editor.
+
+Create a SOURCE subtitle SRT from the Qwen ASR transcript below.
+
+CRITICAL RULES:
+
+- The Qwen ASR transcript is the AUTHORITATIVE spoken text.
+- Do NOT perform a new transcription.
+- Do NOT translate.
+- Do NOT paraphrase.
+- Do NOT summarize.
+- Do NOT invent words.
+- Do NOT remove spoken content.
+- Preserve the meaning and wording of the Qwen transcript.
+- Use the supplied audio ONLY to determine timing and subtitle segmentation.
+- Create sequential, readable subtitle lines.
+- Prefer short subtitle phrases.
+- Do not create subtitles for silence.
+- Every spoken part from the Qwen transcript must be represented.
+- Timestamp format MUST be M:SS.S.
+- Return ONLY valid JSON.
+
+Schema:
+[
+  {
+    "id": "1",
+    "start": "0:00.0",
+    "end": "0:02.5",
+    "text": "source subtitle"
+  }
+]
+
+QWEN ASR TRANSCRIPT:
+${rawTranscript}
+`;
+
+      const qwenAudioBuffer = fs.readFileSync(uploadPath);
+      const qwenAudioBlob = new Blob([qwenAudioBuffer]);
+
+      const qwenGeminiUpload =
+        await currentAi.files.upload({
+          file: qwenAudioBlob,
+          config: { mimeType: uploadMime }
+        });
+
+      let qwenFileState =
+        await currentAi.files.get({
+          name: qwenGeminiUpload.name
+        });
+
+      let qwenFileRetries = 0;
+
+      while (
+        qwenFileState.state === 'PROCESSING' &&
+        qwenFileRetries < 40
+      ) {
+        await new Promise(r => setTimeout(r, 3000));
+
+        qwenFileState =
+          await currentAi.files.get({
+            name: qwenGeminiUpload.name
+          });
+
+        qwenFileRetries++;
+      }
+
+      if (qwenFileState.state === 'FAILED') {
+        throw new Error(
+          'Gemini audio processing failed while creating Qwen timestamps.'
+        );
+      }
+
+      const sourceResponse =
+        await currentAi.models.generateContent({
+          model: activeGeminiModel,
+          contents: [{
+            role: 'user',
+            parts: [
+              { text: sourceSubtitlePrompt },
+              {
+                fileData: {
+                  fileUri: qwenGeminiUpload.uri,
+                  mimeType: uploadMime
+                }
+              }
+            ]
+          }],
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  id: { type: Type.STRING },
+                  start: { type: Type.STRING },
+                  end: { type: Type.STRING },
+                  text: { type: Type.STRING }
+                },
+                required: [
+                  "id",
+                  "start",
+                  "end",
+                  "text"
+                ]
+              }
+            }
+          }
+        });
+
+      let sourceResponseText =
+        sourceResponse.text || '';
+
+      sourceResponseText = sourceResponseText
+        .replace(/^\s*```json\s*/, '')
+        .replace(/\s*```\s*$/, '')
+        .trim();
+
+      let qwenSourceLines;
+
+      try {
+        qwenSourceLines =
+          JSON.parse(sourceResponseText);
+      } catch (parseError) {
+        throw new Error(
+          'Could not parse Qwen source SRT JSON: ' +
+          sourceResponseText.substring(0, 500)
+        );
+      }
+
+      if (
+        !Array.isArray(qwenSourceLines) ||
+        qwenSourceLines.length === 0
+      ) {
+        throw new Error(
+          'Qwen source subtitle generation returned 0 lines.'
+        );
+      }
+
+      qwenSourceLines =
+        qwenSourceLines.map(
+          (line: any, index: number) => ({
+            id: String(
+              line.id || `${jobId}-qwen-${index + 1}`
+            ),
+            start: String(
+              line.start || '0:00.0'
+            ),
+            end: String(
+              line.end || line.start || '0:00.0'
+            ),
+            text: String(
+              line.text || ''
+            ).trim()
+          })
+        ).filter(
+          (line: any) => line.text.length > 0
+        );
+
+      if (qwenSourceLines.length === 0) {
+        throw new Error(
+          'Qwen source subtitle contains no valid text.'
+        );
+      }
+
+      console.log(
+        `[QWEN] Source SRT created: ${qwenSourceLines.length} lines`
+      );
+
+      // ========================================================
+      // STEP 3: GEMINI TRANSLATES ONLY THE TEXT
+      // ========================================================
+
+      jobs.set(jobId, {
+        status: 'translating Qwen subtitles to Khmer',
+        progress: 85
+      });
+
+      const qwenLines =
+        await translateSubtitleLinesToKhmer(
+          qwenSourceLines,
+          activeGeminiModel
+        );
+
+      console.log(
+        `[QWEN] Translation completed: ${qwenLines.length} lines`
+      );
+
+      // Cleanup Gemini uploaded audio.
+      try {
+        await currentAi.files.delete({
+          name: qwenGeminiUpload.name
+        });
+      } catch (cleanupError) {
+        console.error(
+          '[QWEN] Failed to delete Gemini audio:',
+          cleanupError
+        );
+      }
+
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+
+      if (
+        uploadPath !== filePath &&
+        fs.existsSync(uploadPath)
+      ) {
+        fs.unlinkSync(uploadPath);
+      }
+
+      jobs.set(jobId, {
+        status: 'done',
+        progress: 100,
+        lines: qwenLines
+      });
+
+      console.log(
+        `[QWEN] Completed successfully: ${qwenLines.length} subtitle lines`
+      );
+
+      return;
+
+    } catch (qwenError: any) {
+      console.error(
+        '[QWEN ASR ERROR]',
+        qwenError
+      );
+
+      throw new Error(
+        'Qwen Khmer ASR failed: ' +
+        (qwenError?.message || qwenError)
+      );
+    }
+  }
+
+  if (activeModel === 'amazon') {
          jobs.set(jobId, { status: 'uploading to s3', progress: 45 });
          console.log(`Uploading file to S3... ${uploadPath}`);
          
@@ -566,40 +920,7 @@ if (activeModel === 'amazon') {
               {
                 role: 'user',
                 parts: [
-                  { text: `You are an expert professional subtitle transcriber and translator.
-
-TASK:
-Listen to and process the ENTIRE audio/video from beginning to end. Do NOT summarize the content.
-
-TRANSCRIPTION AND SEGMENTATION RULES:
-1. Capture EVERY spoken dialogue and do not omit, summarize, or paraphrase any speech.
-2. Preserve the actual chronological order of all speech.
-3. Create MANY short sequential subtitle segments following natural speech phrases.
-4. Prefer approximately 1-6 seconds per subtitle segment when speech allows.
-5. Split long sentences into multiple subtitle segments at natural pauses or phrase boundaries.
-6. Do NOT combine multiple separate sentences or long dialogue into one subtitle.
-7. Do NOT create only a small number of large subtitle blocks.
-8. Each subtitle must have accurate start and end timestamps based on the actual audio.
-9. Timestamps must cover the complete spoken content throughout the video, not just the beginning.
-10. Continue processing until the END of the audio/video.
-11. If there are pauses or silence, do not invent dialogue during silence.
-12. If multiple people speak, preserve the chronological sequence of their speech.
-13. ALL subtitle text must be translated into natural Khmer (Cambodian).
-14. Do NOT output the original-language transcript.
-15. Do NOT summarize.
-
-IMPORTANT:
-The video may be several minutes long. Do NOT reduce the entire video to a small number of subtitle entries simply to save tokens. Produce as many accurate subtitle segments as reasonably possible.
-
-OUTPUT:
-Return ONLY a valid JSON array.
-Each object MUST use exactly this schema:
-{ id: string, start: string, end: string, text: string }
-
-Use timestamp format M:SS.S or MM:SS.S.
-IDs must be sequential: 1, 2, 3, 4, ...
-Do not output markdown or explanations.
-Do not output an empty array unless there is absolutely no speech.` },
+                  { text: 'You are a professional subtitle translator. You MUST transcribe and translate the ENTIRE audio into Khmer (Cambodian). DO NOT skip any dialogue. Pay close attention to the entire duration. ALL subtitle text MUST be in the Khmer language. Do NOT output the original language. Break the translation down into sequential subtitle lines with accurate start and end timestamps (M:SS.S). If the video is long, you must process as much as you can. Return ONLY a valid JSON array of objects with the schema: { id: string, start: string, end: string, text: string }. Do not output an empty array unless there is absolutely zero speech.' },
                   { fileData: { fileUri: uploadResult.uri, mimeType: uploadMime } }
                 ]
               }

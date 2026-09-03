@@ -566,40 +566,7 @@ if (activeModel === 'amazon') {
               {
                 role: 'user',
                 parts: [
-                  { text: `You are an expert professional subtitle transcriber and translator.
-
-TASK:
-Listen to and process the ENTIRE audio/video from beginning to end. Do NOT summarize the content.
-
-TRANSCRIPTION AND SEGMENTATION RULES:
-1. Capture EVERY spoken dialogue and do not omit, summarize, or paraphrase any speech.
-2. Preserve the actual chronological order of all speech.
-3. Create MANY short sequential subtitle segments following natural speech phrases.
-4. Prefer approximately 1-6 seconds per subtitle segment when speech allows.
-5. Split long sentences into multiple subtitle segments at natural pauses or phrase boundaries.
-6. Do NOT combine multiple separate sentences or long dialogue into one subtitle.
-7. Do NOT create only a small number of large subtitle blocks.
-8. Each subtitle must have accurate start and end timestamps based on the actual audio.
-9. Timestamps must cover the complete spoken content throughout the video, not just the beginning.
-10. Continue processing until the END of the audio/video.
-11. If there are pauses or silence, do not invent dialogue during silence.
-12. If multiple people speak, preserve the chronological sequence of their speech.
-13. ALL subtitle text must be translated into natural Khmer (Cambodian).
-14. Do NOT output the original-language transcript.
-15. Do NOT summarize.
-
-IMPORTANT:
-The video may be several minutes long. Do NOT reduce the entire video to a small number of subtitle entries simply to save tokens. Produce as many accurate subtitle segments as reasonably possible.
-
-OUTPUT:
-Return ONLY a valid JSON array.
-Each object MUST use exactly this schema:
-{ id: string, start: string, end: string, text: string }
-
-Use timestamp format M:SS.S or MM:SS.S.
-IDs must be sequential: 1, 2, 3, 4, ...
-Do not output markdown or explanations.
-Do not output an empty array unless there is absolutely no speech.` },
+                  { text: 'You are a professional subtitle translator. You MUST transcribe and translate the ENTIRE audio into Khmer (Cambodian). DO NOT skip any dialogue. Pay close attention to the entire duration. ALL subtitle text MUST be in the Khmer language. Do NOT output the original language. Break the translation down into sequential subtitle lines with accurate start and end timestamps (M:SS.S). If the video is long, you must process as much as you can. Return ONLY a valid JSON array of objects with the schema: { id: string, start: string, end: string, text: string }. Do not output an empty array unless there is absolutely zero speech.' },
                   { fileData: { fileUri: uploadResult.uri, mimeType: uploadMime } }
                 ]
               }

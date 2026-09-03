@@ -1,0 +1,19 @@
+from fastapi import FastAPI
+
+app = FastAPI(
+    title="AI-Dinmagic FastAPI",
+    version="1.0.0"
+)
+
+@app.get("/")
+def root():
+    return {
+        "status": "running",
+        "service": "AI-Dinmagic FastAPI"
+    }
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok"
+    }

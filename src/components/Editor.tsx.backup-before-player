@@ -12,19 +12,12 @@ interface EditorProps {
   awsSecretAccessKey: string;
   awsRegion: string;
   awsS3Bucket: string;
-  workflow: string;
   voice: 'Piseth' | 'Sreymom';
   model: string;
 }
 
-export default function Editor({ onNavigate, videoFile, apiKey, awsAccessKeyId, awsSecretAccessKey, awsRegion, awsS3Bucket, workflow, voice, model }: EditorProps) {
+export default function Editor({ onNavigate, videoFile, apiKey, awsAccessKeyId, awsSecretAccessKey, awsRegion, awsS3Bucket, voice, model }: EditorProps) {
   const [lines, setLines] = useState<SubtitleLine[]>([]);
-
-  const linesRef = useRef<SubtitleLine[]>([]);
-
-  useEffect(() => {
-    linesRef.current = lines;
-  }, [lines]);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [transcribeStatus, setTranscribeStatus] = useState<string>('');
   const [transcribeProgress, setTranscribeProgress] = useState(0);
@@ -38,27 +31,7 @@ export default function Editor({ onNavigate, videoFile, apiKey, awsAccessKeyId, 
   const [generatingLines, setGeneratingLines] = useState<Set<string>>(new Set());
   const [ttsBatchProgress, setTtsBatchProgress] = useState({ current: 0, total: 0, active: false });
   
-  
-  // Unified MAGIC PROCESS progress: one continuous 0–100% cycle
-  const magicProgress = (() => {
-    if (isTranscribing) {
-      return Math.round(transcribeProgress * 0.33);
-    }
-
-    if (ttsBatchProgress.active) {
-      const ttsProgress =
-        (ttsBatchProgress.current / Math.max(ttsBatchProgress.total, 1)) * 100;
-      return Math.round(33 + ttsProgress * 0.34);
-    }
-
-    if (isExporting) {
-      return Math.round(67 + exportProgress * 0.33);
-    }
-
-    return downloadUrl ? 100 : 0;
-  })();
-
-const videoRef = useRef<HTMLVideoElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
   const audioRefs = useRef<{ [id: string]: HTMLAudioElement }>({});
 
   const [videoUrl, setVideoUrl] = useState<string>('');
@@ -67,7 +40,6 @@ const videoRef = useRef<HTMLVideoElement>(null);
     if (videoFile) {
       const url = URL.createObjectURL(videoFile);
       setVideoUrl(url);
-
       return () => URL.revokeObjectURL(url);
     }
   }, [videoFile]);
@@ -155,7 +127,6 @@ const videoRef = useRef<HTMLVideoElement>(null);
            fileId, 
            mimetype: videoFile.type || 'video/mp4', 
            model,
-           workflow,
            totalChunks
         }),
       });
@@ -209,8 +180,6 @@ const videoRef = useRef<HTMLVideoElement>(null);
             audioUrl: null
           }));
           setLines(newLines);
-          // Keep ref synchronized immediately for MAGIC PROCESS.
-          linesRef.current = newLines;
           setTranscribeProgress(100);
           setTranscribeStatus('រួចរាល់!');
           // Server will handle 0 lines check
@@ -243,7 +212,7 @@ const videoRef = useRef<HTMLVideoElement>(null);
     setLines(lines.map(l => l.id === id ? { ...l, selected: !l.selected } : l));
   };
 
-  const generateAudioForLine = async (lineId: string, text: string): Promise<boolean> => {
+  const generateAudioForLine = async (lineId: string, text: string) => {
     try {
       setGeneratingLines(prev => {
         const next = new Set(prev);
@@ -257,33 +226,15 @@ const videoRef = useRef<HTMLVideoElement>(null);
         body: JSON.stringify({ text, voice })
       });
 
-      if (!res.ok) {
-        const errorText = await res.text().catch(() => '');
-        throw new Error(errorText || `TTS Failed (${res.status})`);
-      }
+      if (!res.ok) throw new Error('TTS Failed');
 
       const blob = await res.blob();
-
-      if (!blob || blob.size === 0) {
-        throw new Error('TTS returned empty audio');
-      }
-
       const url = URL.createObjectURL(blob);
-
-      // Update ref immediately so the next operation sees the latest audio.
-      const updated = linesRef.current.map(l =>
-        l.id === lineId
-          ? { ...l, generated: true, audioUrl: url }
-          : l
-      );
-
-      linesRef.current = updated;
-      setLines(updated);
-
-      return true;
+      
+      setLines(prev => prev.map(l => l.id === lineId ? { ...l, generated: true, audioUrl: url } : l));
     } catch (err) {
-      console.error(`TTS failed for line ${lineId}:`, err);
-      return false;
+      console.error(err);
+      alert('Failed to generate audio for line');
     } finally {
       setGeneratingLines(prev => {
         const next = new Set(prev);
@@ -316,108 +267,7 @@ const videoRef = useRef<HTMLVideoElement>(null);
     audio.play();
   };
 
-  // ✨ MAGIC PROCESS
-  // One click: Transcribe/Translate → Edge TTS → Export Video
-  const handleMagicProcess = async () => {
-    if (!videoFile || isTranscribing || isExporting || ttsBatchProgress.active) {
-      return;
-    }
-
-    try {
-      // STEP 1 — Transcribe + Translate using the existing
-      // Gemini API key from the App Settings slot.
-      if (linesRef.current.length === 0) {
-        await handleTranscribe();
-      }
-
-      // handleTranscribe now updates linesRef.current immediately,
-      // so do not wait up to 60 seconds for React state.
-      const currentLines = linesRef.current;
-
-      if (currentLines.length === 0) {
-        throw new Error('មិនមាន Subtitle Lines បន្ទាប់ពី Transcribe');
-      }
-
-      console.log(
-        `✨ TRANSCRIBE READY: ${currentLines.length} subtitle lines`
-      );
-
-      // STEP 2 — Generate Edge TTS for every subtitle line
-      const linesToGenerate = currentLines.filter(line => !line.audioUrl);
-
-      if (linesToGenerate.length > 0) {
-        setTtsBatchProgress({
-          current: 0,
-          total: linesToGenerate.length,
-          active: true
-        });
-
-        let completed = 0;
-
-        for (const line of linesToGenerate) {
-            const success = await generateAudioForLine(line.id, line.text);
-            if (!success) {
-              throw new Error(`Edge TTS បរាជ័យសម្រាប់ subtitle: ${line.id}`);
-            }
-            completed++;
-            setTtsBatchProgress({
-              current: completed,
-              total: linesToGenerate.length,
-              active: completed < linesToGenerate.length
-            });
-          }
-      }
-
-      setTtsBatchProgress({
-        current: linesToGenerate.length,
-        total: linesToGenerate.length,
-        active: false
-      });
-
-      // STEP 3 — Verify the ref has the latest TTS audio.
-      // generateAudioForLine() already updates linesRef.current.
-      const finalLines = linesRef.current;
-
-      const missingAudio = finalLines.filter(line => !line.audioUrl);
-
-      if (missingAudio.length > 0) {
-        throw new Error(
-          `Edge TTS មិនទាន់រួចរាល់ ${missingAudio.length}/${finalLines.length} lines`
-        );
-      }
-
-      console.log(
-        `✨ MAGIC READY: ${finalLines.length} subtitles + ` +
-        `${finalLines.filter(line => line.audioUrl).length} Khmer audio files`
-      );
-
-      // STEP 4 — Export using the latest ref state.
-      await handleExport();
-
-    } catch (err: any) {
-      console.error("MAGIC PROCESS ERROR:", err);
-
-      setTtsBatchProgress({
-        current: 0,
-        total: 0,
-        active: false
-      });
-
-      setTranscribeError(
-        err?.message || 'MAGIC PROCESS បរាជ័យ'
-      );
-    }
-  };
-
   const handleExport = async () => {
-    // Always export the latest subtitle/TTS state.
-    // React state may still be one render behind after Magic TTS.
-    const exportLines = linesRef.current;
-
-    if (exportLines.length === 0) {
-      throw new Error('មិនមាន Subtitle Lines សម្រាប់ Export');
-    }
-
     setIsExporting(true);
     setExportProgress(0);
     
@@ -444,7 +294,7 @@ const videoRef = useRef<HTMLVideoElement>(null);
         return `${h}:${m}:${s},${ms}`;
       };
 
-      const srtContent = exportLines.map((line, index) => {
+      const srtContent = lines.map((line, index) => {
         return `${index + 1}\n${toSrtTime(line.start)} --> ${toSrtTime(line.end)}\n${line.text}\n`;
       }).join('\n');
 
@@ -484,7 +334,7 @@ const videoRef = useRef<HTMLVideoElement>(null);
       formData.append('srt', new Blob([srtContent], { type: 'text/srt' }), 'subtitles.srt');
       
       const audioMetadata = [];
-      const audioLines = exportLines.filter(l => l.audioUrl);
+      const audioLines = lines.filter(l => l.audioUrl);
       
       for (let i = 0; i < audioLines.length; i++) {
         const line = audioLines[i];
@@ -607,13 +457,23 @@ const videoRef = useRef<HTMLVideoElement>(null);
             ref={videoRef}
             src={videoUrl} 
             className="w-full h-full object-contain"
-                                  controls
-                                  playsInline
-                                  onEnded={() => setIsPlaying(false)}
-            />
+            onEnded={() => setIsPlaying(false)}
+            onClick={togglePlay}
+          />
         ) : (
           <div className="text-gray-600 text-sm">No video selected</div>
         )}
+        <button 
+          onClick={togglePlay}
+          className={`absolute inset-0 flex items-center justify-center bg-black/20 transition duration-300 ${isPlaying ? 'opacity-0 group-hover:opacity-100' : 'opacity-100'}`}
+        >
+          <div className="w-14 h-14 flex items-center justify-center bg-black/50 rounded-full text-white backdrop-blur-sm shadow-lg">
+            {isPlaying ? <Pause size={28} /> : <Play size={28} className="ml-1" />}
+          </div>
+        </button>
+        <div className="absolute bottom-3 right-3 p-1.5 bg-black/60 backdrop-blur-sm rounded text-gray-300">
+          <Volume2 size={16} />
+        </div>
       </div>
 
       {/* Subtitle List Header */}
@@ -651,197 +511,86 @@ const videoRef = useRef<HTMLVideoElement>(null);
           </div>
         )}
 
-        {(isTranscribing || ttsBatchProgress.active || isExporting) && (
-          <div className="absolute inset-0 z-30 flex items-center justify-center bg-[#08060f]/95 backdrop-blur-md animate-in fade-in">
-            <div className="relative w-[340px] max-w-[92vw] overflow-hidden rounded-[20px] border border-white/[0.06] bg-[radial-gradient(ellipse_at_top,#1a1330,#08060f_70%)] px-6 py-8">
-
-              {/* Ambient glow */}
-              <div className="absolute -left-16 -top-16 h-[220px] w-[220px] rounded-full bg-[radial-gradient(circle,rgba(168,85,247,0.35),transparent_70%)] blur-[10px] animate-pulse" />
-              <div className="absolute -bottom-16 -right-10 h-[200px] w-[200px] rounded-full bg-[radial-gradient(circle,rgba(236,72,153,0.30),transparent_70%)] blur-[10px] animate-pulse" />
-
-              <div className="relative text-center">
-
-                {/* Progress circle */}
-                <div className="relative mx-auto mb-5 h-40 w-40">
-
-                  <div className="absolute inset-2 rounded-full border border-white/[0.06] bg-purple-500/[0.08] backdrop-blur-md" />
-
-                  <svg
-                    className="absolute inset-0 h-full w-full -rotate-90"
-                    viewBox="0 0 160 160"
-                  >
-                    <circle
-                      cx="80"
-                      cy="80"
-                      r="66"
-                      fill="none"
-                      stroke="rgba(255,255,255,0.06)"
-                      strokeWidth="7"
-                    />
-
-                    <circle
-                      cx="80"
-                      cy="80"
-                      r="66"
-                      fill="none"
-                      stroke="url(#magic-progress-gradient)"
-                      strokeWidth="7"
-                      strokeLinecap="round"
-                      strokeDasharray="414.7"
-                      strokeDashoffset={
-                        414.7 - (magicProgress / 100) * 414.7
-                      }
-                      style={{
-                        filter:
-                          "drop-shadow(0 0 6px rgba(168,85,247,0.7))",
-                        transition:
-                          "stroke-dashoffset 350ms ease-out",
-                      }}
-                    />
-
-                    <defs>
-                      <linearGradient
-                        id="magic-progress-gradient"
-                        x1="0%"
-                        y1="0%"
-                        x2="100%"
-                        y2="100%"
-                      >
-                        <stop offset="0%" stopColor="#c084fc" />
-                        <stop offset="50%" stopColor="#8b5cf6" />
-                        <stop offset="100%" stopColor="#f472b6" />
-                      </linearGradient>
-                    </defs>
-                  </svg>
-
-                  {/* Two touching animated gears */}
-                  <div className="absolute inset-0 flex flex-col items-center justify-center">
-
-                    <div className="relative mb-1 h-12 w-[76px]">
-
-                      <span
-                        className="absolute left-0 top-[-5px] inline-block select-none text-[40px] leading-none"
-                        style={{
-                          color: "transparent",
-                          background:
-                            "linear-gradient(135deg,#c4b5fd,#8b5cf6)",
-                          WebkitBackgroundClip: "text",
-                          backgroundClip: "text",
-                          filter:
-                            "drop-shadow(0 0 6px rgba(139,92,246,0.6))",
-                          animation:
-                            "magicGearCW 2.2s linear infinite",
-                          transformOrigin: "center",
-                        }}
-                      >
-                        ⚙
-                      </span>
-
-                      <span
-                        className="absolute left-[44px] top-[6px] inline-block select-none text-[24px] leading-none"
-                        style={{
-                          color: "transparent",
-                          background:
-                            "linear-gradient(135deg,#f9a8d4,#ec4899)",
-                          WebkitBackgroundClip: "text",
-                          backgroundClip: "text",
-                          filter:
-                            "drop-shadow(0 0 5px rgba(236,72,153,0.6))",
-                          animation:
-                            "magicGearCCW 1.5s linear infinite",
-                          transformOrigin: "center",
-                        }}
-                      >
-                        ⚙
-                      </span>
-
-                    </div>
-
-                    {/* Percentage */}
-                    <p className="mt-2 text-[32px] font-medium tracking-[-0.5px] text-white">
-                      {magicProgress}
-                      <span className="text-base text-[#c9c3e8]">%</span>
-                    </p>
-
-                  </div>
+        {isTranscribing && (
+          <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-[#0f0f13]/95 backdrop-blur-sm animate-in fade-in">
+             <div className="relative flex items-center justify-center w-28 h-28">
+                <svg className="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
+                  <circle cx="50" cy="50" r="42" fill="transparent" stroke="currentColor" strokeWidth="8" className="text-gray-800" />
+                  <circle
+                    cx="50"
+                    cy="50"
+                    r="42"
+                    fill="transparent"
+                    stroke="url(#progress-gradient)"
+                    strokeWidth="8"
+                    strokeLinecap="round"
+                    className="transition-all duration-300 ease-out"
+                    style={{
+                      strokeDasharray: 263.89,
+                      strokeDashoffset: 263.89 - (transcribeProgress / 100) * 263.89,
+                    }}
+                  />
+                  <defs>
+                    <linearGradient id="progress-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                      <stop offset="0%" stopColor="#db2777" />
+                      <stop offset="100%" stopColor="#dc2626" />
+                    </linearGradient>
+                  </defs>
+                </svg>
+                <div className="absolute inset-0 flex flex-col items-center justify-center">
+                  <span className="text-3xl font-bold text-white tracking-tighter">
+                    {Math.round(transcribeProgress)}<span className="text-base text-gray-400 ml-0.5">%</span>
+                  </span>
                 </div>
+             </div>
+          </div>
+        )}
 
+        {ttsBatchProgress.active && (
+          <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-[#0f0f13]/95 backdrop-blur-sm animate-in fade-in">
+             <div className="relative flex items-center justify-center w-24 h-24">
+                <svg className="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
+                  <circle cx="50" cy="50" r="42" fill="transparent" stroke="currentColor" strokeWidth="8" className="text-gray-800" />
+                  <circle
+                    cx="50"
+                    cy="50"
+                    r="42"
+                    fill="transparent"
+                    stroke="#6366f1"
+                    strokeWidth="8"
+                    strokeLinecap="round"
+                    className="transition-all duration-300 ease-out"
+                    style={{
+                      strokeDasharray: 263.89,
+                      strokeDashoffset: 263.89 - ((ttsBatchProgress.current / Math.max(ttsBatchProgress.total, 1))) * 263.89,
+                    }}
+                  />
+                </svg>
+                <div className="absolute inset-0 flex flex-col items-center justify-center">
+                  <Mic size={20} className="text-indigo-400 mb-1" />
+                  <span className="text-lg font-bold text-white tracking-tighter">
+                    {ttsBatchProgress.current}<span className="text-xs text-gray-400 mx-0.5">/</span>{ttsBatchProgress.total}
+                  </span>
+                </div>
+             </div>
+             <div className="text-sm font-medium text-indigo-500 mb-2 flex items-center gap-2">
+                <Loader2 size={16} className="animate-spin" /> កំពុងបង្កើតសំឡេង...
+             </div>
+          </div>
+        )}
 
-
-              </div>
-
-              <style>{`
-                @keyframes turtleWalkLR {
-                    0% {
-                      transform: translateX(0) translateY(2px) scaleX(1);
-                    }
-                    25% {
-                      transform: translateX(45px) translateY(-3px) scaleX(1);
-                    }
-                    50% {
-                      transform: translateX(90px) translateY(2px) scaleX(1);
-                    }
-                    75% {
-                      transform: translateX(135px) translateY(-3px) scaleX(1);
-                    }
-                    100% {
-                      transform: translateX(0) translateY(2px) scaleX(1);
-                    }
-                  }
-
-                  @keyframes magicButtonTurtle {
-                    0% {
-                      left: 0;
-                      transform: translateY(2px);
-                    }
-                    25% {
-                      left: 25%;
-                      transform: translateY(-2px);
-                    }
-                    50% {
-                      left: calc(100% - 30px);
-                      transform: translateY(2px);
-                    }
-                    75% {
-                      left: 25%;
-                      transform: translateY(-2px);
-                    }
-                    100% {
-                      left: 0;
-                      transform: translateY(2px);
-                    }
-                  }
-
-                  @keyframes magicGearCW {
-                  from { transform: rotate(0deg); }
-                  to { transform: rotate(360deg); }
-                }
-
-                @keyframes magicGearCCW {
-                  from { transform: rotate(360deg); }
-                  to { transform: rotate(0deg); }
-                }
-
-                @keyframes magicGradient {
-                  0% { background-position: 0% 50%; }
-                  50% { background-position: 100% 50%; }
-                  100% { background-position: 0% 50%; }
-                }
-
-                @keyframes magicPulse {
-                  0%,100% {
-                    box-shadow:
-                      0 8px 30px rgba(168,85,247,0.4),
-                      inset 0 1px 0 rgba(255,255,255,0.2);
-                  }
-                  50% {
-                    box-shadow:
-                      0 8px 46px rgba(236,72,153,0.8),
-                      inset 0 1px 0 rgba(255,255,255,0.3);
-                  }
-                }
-              `}</style>
-
+        {transcribeError && (
+          <div className="mx-4 my-4 p-4 bg-red-900/30 border border-red-900/50 rounded-xl text-red-400 text-sm animate-in fade-in flex items-start gap-3">
+            <div className="mt-0.5"><Square size={16} className="text-red-500" /></div>
+            <div>
+              <div className="font-bold mb-1 text-red-300">ដំណើរការបរាជ័យ (Process Failed)</div>
+              <div className="break-all">{transcribeError}</div>
+              <button 
+                onClick={() => setTranscribeError(null)}
+                className="mt-2 text-xs bg-red-900/50 hover:bg-red-900/80 px-3 py-1.5 rounded-lg transition"
+              >
+                Dismiss
+              </button>
             </div>
           </div>
         )}
@@ -852,8 +601,8 @@ const videoRef = useRef<HTMLVideoElement>(null);
              <div className="w-24 h-24 rounded-full bg-green-900/30 flex items-center justify-center mb-6 border border-green-500/30">
                 <CheckCircle2 size={40} className="text-green-500" />
              </div>
-             
-             
+             <h3 className="text-2xl font-semibold text-white mb-2">ជោគជ័យ! (Success)</h3>
+             <p className="text-gray-400 mb-6 max-w-sm text-center">វីដេអូរបស់អ្នកត្រូវបាននាំចេញរួចរាល់។ សូមចុច "រក្សាទុក" ឬចុចឱ្យយូរលើវីដេអូដើម្បី Save។</p>
              
              <div className="flex flex-col sm:flex-row gap-4">
                 <button 
@@ -895,10 +644,10 @@ const videoRef = useRef<HTMLVideoElement>(null);
                   }}
                   className="px-8 py-3 bg-green-600 hover:bg-green-500 text-white rounded-xl font-medium transition flex items-center gap-2"
                 >
-                   <Download size={20} />
+                   <Download size={20} /> រក្សាទុកចូល Gallery (Share)
                 </button>
                 <button onClick={() => setDownloadUrl(null)} className="px-6 py-3 bg-gray-800 hover:bg-gray-700 text-white rounded-xl font-medium transition">
-                   
+                   បិទ (Close)
                 </button>
              </div>
              </div>
@@ -987,33 +736,46 @@ const videoRef = useRef<HTMLVideoElement>(null);
       </div>
 
       {/* Bottom Action Bar */}
-      <div className="bg-gray-950/90 backdrop-blur-md p-4 border-t border-gray-900 shrink-0 pb-6 z-20">
-  <button
-    onClick={handleMagicProcess}
-    disabled={!videoFile || isTranscribing || isExporting || ttsBatchProgress.active}
-    className={`w-full flex items-center justify-center gap-3 py-4 px-5 rounded-2xl border transition-all ${
-      videoFile && !isTranscribing && !isExporting && !ttsBatchProgress.active
-        ? 'bg-gradient-to-r from-pink-600 via-purple-600 to-indigo-600 text-white border-purple-400/30 hover:scale-[1.01] shadow-[0_0_25px_rgba(139,92,246,0.25)]'
-        : 'bg-gray-900/50 text-gray-600 border-gray-800 cursor-not-allowed'
-    }`}
-  >
-    {isTranscribing || isExporting || ttsBatchProgress.active ? (
-  <div className="relative flex items-center w-full h-12 overflow-hidden">
-      <span
-        className="absolute left-0 text-[30px] select-none"
-        style={{
-          animation: "magicButtonTurtle 7s ease-in-out infinite",
-          filter: "drop-shadow(0 0 5px rgba(34,197,94,0.55))",
-        }}
-      >
-        🐢
-      </span>
-    </div>
-) : (
-  <span className="text-2xl">✨</span>
-)}
-  </button>
-</div>
+      <div className="bg-gray-950/90 backdrop-blur-md p-4 border-t border-gray-900 grid grid-cols-3 gap-3 shrink-0 pb-6 z-20">
+        <button 
+          onClick={handleTranscribe}
+          disabled={lines.length > 0}
+          className={`flex flex-col items-center justify-center gap-1.5 py-3 px-1 rounded-xl border transition-all ${
+            lines.length === 0 
+              ? 'bg-pink-900/20 text-pink-500 border-pink-900/30 hover:bg-pink-900/30' 
+              : 'bg-gray-900/50 text-gray-600 border-gray-800 cursor-not-allowed'
+          }`}
+        >
+          <FileAudio size={22} className={lines.length === 0 ? "text-pink-400" : ""} />
+          <span className="text-[11px] font-medium tracking-wide">បកប្រែជាអក្សរ</span>
+          <span className="text-[9px] opacity-60">{totalCount > 0 ? `${totalCount}/${totalCount}` : '0/0'}</span>
+        </button>
+        <button 
+          onClick={handleGenerateAI}
+          disabled={selectedCount === 0 || generatedCount === totalCount && totalCount > 0}
+          className={`flex flex-col items-center justify-center gap-1.5 py-3 px-1 rounded-xl border transition-all ${
+            selectedCount > 0 
+              ? 'bg-indigo-900/20 text-indigo-400 border-indigo-900/40 hover:bg-indigo-900/30 shadow-[0_0_15px_rgba(79,70,229,0.1)]' 
+              : 'bg-gray-900/50 text-gray-600 border-gray-800 cursor-not-allowed'
+          }`}
+        >
+          <Mic size={22} />
+          <span className="text-[11px] font-medium tracking-wide">បង្កើតសំឡេង AI</span>
+          <span className="text-[9px] opacity-60">{generatedCount}/{totalCount} បានបង្កើត</span>
+        </button>
+        <button 
+          onClick={handleExport}
+          disabled={lines.length === 0 || isExporting}
+          className={`flex flex-col items-center justify-center gap-1.5 py-3 px-1 rounded-xl border transition-all ${
+            lines.length > 0 
+              ? 'bg-green-900/20 text-green-500 border-green-900/40 hover:bg-green-900/30 shadow-[0_0_15px_rgba(34,197,94,0.1)]' 
+              : 'bg-gray-900/50 text-gray-600 border-gray-800 cursor-not-allowed'
+          }`}
+        >
+          <Download size={22} />
+          <span className="text-[11px] font-medium tracking-wide">នាំចេញវីដេអូ</span>
+        </button>
+      </div>
     </div>
   );
 }

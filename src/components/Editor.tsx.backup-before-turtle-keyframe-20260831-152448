@@ -12,12 +12,11 @@ interface EditorProps {
   awsSecretAccessKey: string;
   awsRegion: string;
   awsS3Bucket: string;
-  workflow: string;
   voice: 'Piseth' | 'Sreymom';
   model: string;
 }
 
-export default function Editor({ onNavigate, videoFile, apiKey, awsAccessKeyId, awsSecretAccessKey, awsRegion, awsS3Bucket, workflow, voice, model }: EditorProps) {
+export default function Editor({ onNavigate, videoFile, apiKey, awsAccessKeyId, awsSecretAccessKey, awsRegion, awsS3Bucket, voice, model }: EditorProps) {
   const [lines, setLines] = useState<SubtitleLine[]>([]);
 
   const linesRef = useRef<SubtitleLine[]>([]);
@@ -155,7 +154,6 @@ const videoRef = useRef<HTMLVideoElement>(null);
            fileId, 
            mimetype: videoFile.type || 'video/mp4', 
            model,
-           workflow,
            totalChunks
         }),
       });
@@ -789,29 +787,6 @@ const videoRef = useRef<HTMLVideoElement>(null);
                     }
                   }
 
-                  @keyframes magicButtonTurtle {
-                    0% {
-                      left: 0;
-                      transform: translateY(2px);
-                    }
-                    25% {
-                      left: 25%;
-                      transform: translateY(-2px);
-                    }
-                    50% {
-                      left: calc(100% - 30px);
-                      transform: translateY(2px);
-                    }
-                    75% {
-                      left: 25%;
-                      transform: translateY(-2px);
-                    }
-                    100% {
-                      left: 0;
-                      transform: translateY(2px);
-                    }
-                  }
-
                   @keyframes magicGearCW {
                   from { transform: rotate(0deg); }
                   to { transform: rotate(360deg); }
@@ -998,7 +973,7 @@ const videoRef = useRef<HTMLVideoElement>(null);
     }`}
   >
     {isTranscribing || isExporting || ttsBatchProgress.active ? (
-  <div className="relative flex items-center w-full h-12 overflow-hidden">
+  <div className="relative flex items-center justify-center w-20 h-12 overflow-hidden">
       <span
         className="absolute left-0 text-[30px] select-none"
         style={{

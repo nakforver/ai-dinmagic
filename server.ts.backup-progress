@@ -41,8 +41,7 @@ app.use(express.urlencoded({ extended: true, limit: '500mb' }));
 
 const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 500 * 1024 * 1024 } });
 
-const defaultGeminiKey = process.env.GEMINI_API_KEY;
-const ai = defaultGeminiKey ? new GoogleGenAI({ apiKey: defaultGeminiKey }) : null;
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 app.post('/api/upload-chunk', express.raw({ type: '*/*', limit: '500mb' }), async (req, res) => {
   try {
@@ -65,181 +64,8 @@ const jobs = new Map<string, { status: string, progress: number, lines?: any[], 
 const exportJobs = new Map<string, { status: string; error?: string; path?: string; progress?: number; }>();
 const exportCache = new Map<string, string>();
 
-
-// ============================================================
-// SHARED GEMINI SUBTITLE TRANSLATOR
-// ============================================================
-// IMPORTANT:
-// - Receives an already-created source SRT
-// - Translates ONLY the text field
-// - NEVER changes id/start/end
-// - NEVER changes subtitle line count
-// ============================================================
-
-async function translateSubtitleLinesToKhmer(
-  sourceLines: any[],
-  geminiModel: string
-): Promise<any[]> {
-  if (!Array.isArray(sourceLines) || sourceLines.length === 0) {
-    throw new Error('No source subtitle lines available for translation.');
-  }
-
-  const CHUNK_SIZE = 40;
-  const translatedLines: any[] = [];
-
-  console.log(
-    `[TRANSLATE] Translating ${sourceLines.length} subtitle lines using ${geminiModel}`
-  );
-
-  for (let i = 0; i < sourceLines.length; i += CHUNK_SIZE) {
-    const chunk = sourceLines.slice(i, i + CHUNK_SIZE);
-
-    let success = false;
-    let retries = 0;
-    let lastError: any = null;
-
-    while (!success && retries < 3) {
-      try {
-        const response =
-          await currentAi.models.generateContent({
-            model: geminiModel,
-            contents: [{
-              role: 'user',
-              parts: [{
-                text:
-`You are a professional subtitle translator.
-
-Translate the following subtitle JSON array into Khmer (Cambodian).
-
-STRICT RULES:
-
-1. Translate ONLY the "text" field.
-2. NEVER change "id".
-3. NEVER change "start".
-4. NEVER change "end".
-5. Return EXACTLY the same number of subtitle objects.
-6. Keep the EXACT same object order.
-7. Do NOT merge subtitle lines.
-8. Do NOT split subtitle lines.
-9. Do NOT omit any subtitle.
-10. Do NOT add any subtitle.
-11. Preserve the original meaning accurately.
-12. Do not summarize.
-13. Do not invent information.
-14. ALL translated "text" values must be Khmer.
-15. Return ONLY valid JSON.
-16. The output must contain exactly the same structure.
-
-SOURCE SUBTITLES:
-${JSON.stringify(chunk)}`
-              }]
-            }],
-            config: {
-              responseMimeType: 'application/json',
-              responseSchema: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    id: { type: Type.STRING },
-                    start: { type: Type.STRING },
-                    end: { type: Type.STRING },
-                    text: { type: Type.STRING }
-                  },
-                  required: [
-                    "id",
-                    "start",
-                    "end",
-                    "text"
-                  ]
-                }
-              }
-            }
-          });
-
-        let responseText = response.text || '';
-
-        responseText = responseText
-          .replace(/^\s*```json\s*/, '')
-          .replace(/\s*```\s*$/, '')
-          .trim();
-
-        const parsed = JSON.parse(responseText);
-
-        if (!Array.isArray(parsed)) {
-          throw new Error('Gemini translation response is not an array.');
-        }
-
-        if (parsed.length !== chunk.length) {
-          throw new Error(
-            `Gemini returned ${parsed.length} lines, expected ${chunk.length}.`
-          );
-        }
-
-        const validated = chunk.map((originalLine: any, index: number) => {
-          const translated = parsed[index];
-
-          const text =
-            typeof translated?.text === 'string'
-              ? translated.text.trim()
-              : '';
-
-          if (!text) {
-            throw new Error(
-              `Empty translation at subtitle index ${index}.`
-            );
-          }
-
-          return {
-            id: String(originalLine.id),
-            start: String(originalLine.start),
-            end: String(originalLine.end),
-            text
-          };
-        });
-
-        translatedLines.push(...validated);
-        success = true;
-
-        console.log(
-          `[TRANSLATE] Chunk ${i + 1}-${Math.min(i + CHUNK_SIZE, sourceLines.length)} completed`
-        );
-
-      } catch (err: any) {
-        lastError = err;
-
-        console.error(
-          `[TRANSLATE] Chunk ${i} error:`,
-          err?.message || err
-        );
-
-        retries++;
-
-        if (retries < 3) {
-          await new Promise(r => setTimeout(r, 3000));
-        }
-      }
-    }
-
-    if (!success) {
-      throw new Error(
-        'Translation via Gemini failed after 3 attempts: ' +
-        (lastError?.message || lastError)
-      );
-    }
-  }
-
-  if (translatedLines.length !== sourceLines.length) {
-    throw new Error(
-      `Translation line count mismatch: ${translatedLines.length} / ${sourceLines.length}`
-    );
-  }
-
-  return translatedLines;
-}
-
 app.post('/api/transcribe/start', async (req, res) => {
-  const { fileId, mimetype, model, workflow, totalChunks } = req.body;
+  const { fileId, mimetype, model, totalChunks } = req.body;
   const apiKey = req.headers['x-api-key'] as string; // Optional user key from headers
   const reqAwsAccessKeyId = req.headers['x-aws-access-key-id'] as string;
   const reqAwsSecretAccessKey = req.headers['x-aws-secret-access-key'] as string;
@@ -273,15 +99,7 @@ app.post('/api/transcribe/start', async (req, res) => {
          throw new Error('File not found on server');
       }
 
-      const currentAi = apiKey
-          ? new GoogleGenAI({ apiKey })
-          : ai;
-
-        if (!currentAi) {
-          throw new Error(
-            'Gemini API Key មិនត្រូវបានកំណត់។ សូមបញ្ចូល Gemini API Key ក្នុង App Settings។'
-          );
-        }
+      const currentAi = apiKey ? new GoogleGenAI({ apiKey }) : ai;
       
       let uploadPath = filePath;
       let uploadMime = mimetype;
@@ -297,23 +115,380 @@ app.post('/api/transcribe/start', async (req, res) => {
         uploadMime = 'audio/mpeg';
       }
 
-      const activeWorkflow =
-      workflow ||
-      (model === 'amazon'
-        ? 'amazon'
-        : model === 'qwen-khmer'
-          ? 'qwen-khmer'
-          : 'gemini');
+      const activeModel = model || 'gemini-2.5-flash';
 
-    const activeGeminiModel =
-      model &&
-      !['amazon'].includes(model)
-        ? model
-        : 'gemini-2.5-flash';
+/*
+ * QWEN KHMER ASR
+ * Qwen runs separately in ~/qwen-asr
+ */
+const QWEN_ASR_URL =
+  process.env.QWEN_ASR_URL || 'http://127.0.0.1:8000/transcribe';
 
-    const activeModel = activeWorkflow;
+async function transcribeWithQwen(
+  audioPath: string,
+  filename = 'audio.mp3'
+): Promise<string> {
 
-if (activeModel === 'amazon') {
+  console.log('[QWEN ASR] Sending audio to:', QWEN_ASR_URL);
+
+  const audioBuffer = fs.readFileSync(audioPath);
+
+  const form = new FormData();
+
+  const blob = new Blob([audioBuffer], {
+    type: 'audio/mpeg'
+  });
+
+  form.append('file', blob, filename);
+
+  const response = await fetch(QWEN_ASR_URL, {
+    method: 'POST',
+    body: form
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+
+    throw new Error(
+      'Qwen ASR failed (' +
+      response.status +
+      '): ' +
+      errorText
+    );
+  }
+
+  const result: any = await response.json();
+
+  if (!result.text || !result.text.trim()) {
+    throw new Error('Qwen ASR returned empty transcript.');
+  }
+
+  console.log(
+    '[QWEN ASR] Transcript length:',
+    result.text.length
+  );
+
+  return result.text.trim();
+}
+
+      
+      /*
+       * ============================================================
+       * QWEN KHMER ASR PIPELINE
+       * ============================================================
+       *
+       * Video
+       *   ↓
+       * FFmpeg → MP3
+       *   ↓
+       * Qwen Khmer ASR
+       *   ↓
+       * Gemini corrects the raw transcript
+       *   ↓
+       * Gemini creates Khmer subtitle lines + timestamps
+       *
+       * Qwen ASR is running separately in:
+       *   ~/qwen-asr
+       *
+       * FastAPI:
+       *   http://127.0.0.1:8000/transcribe
+       */
+      if (activeModel === 'qwen-khmer') {
+        try {
+          jobs.set(jobId, {
+            status: 'transcribing with Qwen Khmer ASR',
+            progress: 50
+          });
+
+          console.log('[QWEN] Starting Khmer ASR...');
+          console.log('[QWEN] Audio:', uploadPath);
+
+          // Send extracted MP3 to local Qwen ASR server.
+          const rawTranscript = await transcribeWithQwen(
+            uploadPath,
+            path.basename(uploadPath)
+          );
+
+          console.log(
+            '[QWEN] Raw transcript:',
+            rawTranscript.substring(0, 500)
+          );
+
+          jobs.set(jobId, {
+            status: 'correcting transcript with Gemini',
+            progress: 65
+          });
+
+          /*
+           * IMPORTANT:
+           * Qwen is used as the primary ASR.
+           *
+           * Gemini receives the Qwen transcript and corrects
+           * obvious recognition errors using the audio as context.
+           *
+           * We then ask Gemini to create subtitle timestamps.
+           */
+          const correctionPrompt = `
+You are a professional Khmer subtitle editor.
+
+The transcript below was produced by a Khmer ASR model.
+
+Your job:
+1. Correct obvious ASR recognition mistakes.
+2. Preserve the actual meaning and spoken words.
+3. Do NOT invent dialogue.
+4. Do NOT translate yet.
+5. Keep Khmer words natural and readable.
+6. Remove obvious repeated hallucinations caused by ASR.
+7. Return ONLY the corrected Khmer transcript as plain text.
+
+QWEN ASR TRANSCRIPT:
+${rawTranscript}
+`;
+
+          const correctionResponse =
+            await currentAi.models.generateContent({
+              model: 'gemini-2.5-flash',
+              contents: [{
+                role: 'user',
+                parts: [
+                  { text: correctionPrompt }
+                ]
+              }]
+            });
+
+          const correctedTranscript =
+            (correctionResponse.text || '').trim();
+
+          if (!correctedTranscript) {
+            throw new Error(
+              'Gemini returned an empty corrected transcript.'
+            );
+          }
+
+          console.log(
+            '[QWEN] Corrected transcript length:',
+            correctedTranscript.length
+          );
+
+          jobs.set(jobId, {
+            status: 'creating Khmer subtitles',
+            progress: 75
+          });
+
+          /*
+           * Gemini now creates subtitle lines.
+           *
+           * The Qwen transcript is treated as the source text.
+           * Gemini should NOT perform a second independent
+           * transcription.
+           */
+          const subtitlePrompt = `
+You are a professional Khmer subtitle editor.
+
+Create Khmer subtitles for the supplied audio.
+
+IMPORTANT:
+- The Qwen ASR transcript below is the PRIMARY transcript.
+- Use it as the source of spoken content.
+- Do NOT invent words.
+- Do NOT omit spoken dialogue.
+- Keep the Khmer meaning faithful.
+- Split naturally into short subtitle lines.
+- Each line must have accurate start/end timestamps.
+- Timestamp format MUST be M:SS.S
+- Return ONLY valid JSON.
+- Schema:
+  [
+    {
+      "id": "string",
+      "start": "M:SS.S",
+      "end": "M:SS.S",
+      "text": "Khmer subtitle"
+    }
+  ]
+
+CORRECTED QWEN TRANSCRIPT:
+${correctedTranscript}
+`;
+
+          /*
+           * Upload the audio to Gemini only for timing/context.
+           * Gemini must follow the corrected Qwen transcript.
+           */
+          const qwenAudioBuffer = fs.readFileSync(uploadPath);
+          const qwenAudioBlob = new Blob([qwenAudioBuffer]);
+
+          const qwenGeminiUpload =
+            await currentAi.files.upload({
+              file: qwenAudioBlob,
+              config: { mimeType: uploadMime }
+            });
+
+          let qwenFileState =
+            await currentAi.files.get({
+              name: qwenGeminiUpload.name
+            });
+
+          let qwenFileRetries = 0;
+
+          while (
+            qwenFileState.state === 'PROCESSING' &&
+            qwenFileRetries < 40
+          ) {
+            await new Promise(r => setTimeout(r, 3000));
+
+            qwenFileState =
+              await currentAi.files.get({
+                name: qwenGeminiUpload.name
+              });
+
+            qwenFileRetries++;
+          }
+
+          if (qwenFileState.state === 'FAILED') {
+            throw new Error(
+              'Gemini audio processing failed while creating timestamps.'
+            );
+          }
+
+          const subtitleResponse =
+            await currentAi.models.generateContent({
+              model: 'gemini-2.5-flash',
+              contents: [{
+                role: 'user',
+                parts: [
+                  { text: subtitlePrompt },
+                  {
+                    fileData: {
+                      fileUri: qwenGeminiUpload.uri,
+                      mimeType: uploadMime
+                    }
+                  }
+                ]
+              }],
+              config: {
+                responseMimeType: 'application/json',
+                responseSchema: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      id: { type: Type.STRING },
+                      start: { type: Type.STRING },
+                      end: { type: Type.STRING },
+                      text: { type: Type.STRING }
+                    },
+                    required: [
+                      "id",
+                      "start",
+                      "end",
+                      "text"
+                    ]
+                  }
+                }
+              }
+            });
+
+          let qwenResponseText =
+            subtitleResponse.text || '';
+
+          qwenResponseText = qwenResponseText
+            .replace(/^\s*```json\s*/, '')
+            .replace(/\s*```\s*$/, '')
+            .trim();
+
+          let qwenLines;
+
+          try {
+            qwenLines = JSON.parse(qwenResponseText);
+          } catch (parseError) {
+            throw new Error(
+              'Could not parse subtitle JSON from Gemini: ' +
+              qwenResponseText.substring(0, 500)
+            );
+          }
+
+          if (
+            !Array.isArray(qwenLines) ||
+            qwenLines.length === 0
+          ) {
+            throw new Error(
+              'Qwen/Gemini subtitle generation returned 0 lines.'
+            );
+          }
+
+          /*
+           * Ensure every line has the expected structure.
+           */
+          qwenLines = qwenLines
+            .filter((line: any) =>
+              line &&
+              typeof line.text === 'string' &&
+              line.text.trim()
+            )
+            .map((line: any, index: number) => ({
+              id: String(
+                line.id || `${jobId}-qwen-${index + 1}`
+              ),
+              start: String(line.start || '0:00.0'),
+              end: String(line.end || line.start || '0:00.0'),
+              text: String(line.text).trim()
+            }));
+
+          if (qwenLines.length === 0) {
+            throw new Error(
+              'No valid subtitle lines were generated from Qwen transcript.'
+            );
+          }
+
+          try {
+            await currentAi.files.delete({
+              name: qwenGeminiUpload.name
+            });
+          } catch (cleanupError) {
+            console.error(
+              '[QWEN] Failed to delete Gemini audio:',
+              cleanupError
+            );
+          }
+
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+          }
+
+          if (
+            uploadPath !== filePath &&
+            fs.existsSync(uploadPath)
+          ) {
+            fs.unlinkSync(uploadPath);
+          }
+
+          jobs.set(jobId, {
+            status: 'done',
+            progress: 100,
+            lines: qwenLines
+          });
+
+          console.log(
+            `[QWEN] Completed successfully: ${qwenLines.length} subtitle lines`
+          );
+
+          return;
+        } catch (qwenError: any) {
+          console.error(
+            '[QWEN ASR ERROR]',
+            qwenError
+          );
+
+          throw new Error(
+            'Qwen Khmer ASR failed: ' +
+            (qwenError?.message || qwenError)
+          );
+        }
+      }
+
+      if (activeModel === 'amazon') {
          jobs.set(jobId, { status: 'uploading to s3', progress: 45 });
          console.log(`Uploading file to S3... ${uploadPath}`);
          
@@ -449,7 +624,7 @@ if (activeModel === 'amazon') {
              while (!chunkSuccess && generateRetries < 3) {
                  try {
                      const response = await currentAi.models.generateContent({
-                         model: activeGeminiModel,
+                         model: 'gemini-2.5-flash',
                          contents: [{
                              role: 'user',
                              parts: [
@@ -462,36 +637,15 @@ if (activeModel === 'amazon') {
                      });
                      
                      let responseText = response.text || '';
-                     const cleanedResponse = responseText.trim();
-                      const parsedChunk = JSON.parse(cleanedResponse);
-
-                      if (!Array.isArray(parsedChunk)) {
-                        throw new Error("Gemini translation response is not an array.");
-                      }
-
-                      if (parsedChunk.length != chunk.length) {
-                        throw new Error(`Gemini returned ${parsedChunk.length} lines, expected ${chunk.length}.`);
-                      }
-
-                      const validatedChunk = chunk.map((originalLine, index) => {
-                        const translated = parsedChunk[index];
-                        const translatedText = typeof translated?.text === "string"
-                          ? translated.text.trim()
-                          : typeof translated?.Text === "string"
-                            ? translated.Text.trim()
-                            : "";
-
-                        if (!translatedText) {
-                          throw new Error(`Empty translation at index ${index}.`);
-                        }
-
-                        return {
-                          id: originalLine.id,
-                          start: originalLine.start,
-                          end: originalLine.end,
-                          text: translatedText
-                        };
-                      });
+                     const parsedChunk = JSON.parse(responseText.replace(/^\s*```json\s*/, '').replace(/\s*```\s*$/, ''));
+                     
+                     // Ensure no fields were dropped
+                     const validatedChunk = parsedChunk.map((item, index) => ({
+                         id: chunk[index].id,
+                         start: chunk[index].start,
+                         end: chunk[index].end,
+                         text: item.text || item.Text || chunk[index].text
+                     }));
 
                      translatedLines.push(...validatedChunk);
                      chunkSuccess = true;
@@ -560,46 +714,16 @@ if (activeModel === 'amazon') {
             await new Promise(resolve => setTimeout(resolve, 5000 * generateRetries)); // Exponential-ish backoff
           }
           
+          let activeModel = model || 'gemini-2.5-flash';
+          if (activeModel === 'gemini-3.6-flash') activeModel = 'gemini-2.5-flash';
+          
           response = await currentAi.models.generateContent({
-            model: activeGeminiModel,
+            model: activeModel,
             contents: [
               {
                 role: 'user',
                 parts: [
-                  { text: `You are an expert professional subtitle transcriber and translator.
-
-TASK:
-Listen to and process the ENTIRE audio/video from beginning to end. Do NOT summarize the content.
-
-TRANSCRIPTION AND SEGMENTATION RULES:
-1. Capture EVERY spoken dialogue and do not omit, summarize, or paraphrase any speech.
-2. Preserve the actual chronological order of all speech.
-3. Create MANY short sequential subtitle segments following natural speech phrases.
-4. Prefer approximately 1-6 seconds per subtitle segment when speech allows.
-5. Split long sentences into multiple subtitle segments at natural pauses or phrase boundaries.
-6. Do NOT combine multiple separate sentences or long dialogue into one subtitle.
-7. Do NOT create only a small number of large subtitle blocks.
-8. Each subtitle must have accurate start and end timestamps based on the actual audio.
-9. Timestamps must cover the complete spoken content throughout the video, not just the beginning.
-10. Continue processing until the END of the audio/video.
-11. If there are pauses or silence, do not invent dialogue during silence.
-12. If multiple people speak, preserve the chronological sequence of their speech.
-13. ALL subtitle text must be translated into natural Khmer (Cambodian).
-14. Do NOT output the original-language transcript.
-15. Do NOT summarize.
-
-IMPORTANT:
-The video may be several minutes long. Do NOT reduce the entire video to a small number of subtitle entries simply to save tokens. Produce as many accurate subtitle segments as reasonably possible.
-
-OUTPUT:
-Return ONLY a valid JSON array.
-Each object MUST use exactly this schema:
-{ id: string, start: string, end: string, text: string }
-
-Use timestamp format M:SS.S or MM:SS.S.
-IDs must be sequential: 1, 2, 3, 4, ...
-Do not output markdown or explanations.
-Do not output an empty array unless there is absolutely no speech.` },
+                  { text: 'You are a professional subtitle translator. You MUST transcribe and translate the ENTIRE audio into Khmer (Cambodian). DO NOT skip any dialogue. Pay close attention to the entire duration. ALL subtitle text MUST be in the Khmer language. Do NOT output the original language. Break the translation down into sequential subtitle lines with accurate start and end timestamps (M:SS.S). If the video is long, you must process as much as you can. Return ONLY a valid JSON array of objects with the schema: { id: string, start: string, end: string, text: string }. Do not output an empty array unless there is absolutely zero speech.' },
                   { fileData: { fileUri: uploadResult.uri, mimeType: uploadMime } }
                 ]
               }
@@ -695,10 +819,10 @@ Do not output an empty array unless there is absolutely no speech.` },
 
 app.post('/api/test-aws', async (req, res) => {
     try {
-        const reqAwsAccessKeyId = typeof req.headers['x-aws-access-key-id'] === 'string' ? req.headers['x-aws-access-key-id'] : '';
-        const reqAwsSecretAccessKey = typeof req.headers['x-aws-secret-access-key'] === 'string' ? req.headers['x-aws-secret-access-key'] : '';
-        const reqAwsRegion = typeof req.headers['x-aws-region'] === 'string' ? req.headers['x-aws-region'] : 'ap-southeast-2';
-        const reqAwsS3Bucket = typeof req.headers['x-aws-s3-bucket'] === 'string' ? req.headers['x-aws-s3-bucket'] : '';
+        const reqAwsAccessKeyId = req.headers['x-aws-access-key-id'] || '';
+        const reqAwsSecretAccessKey = req.headers['x-aws-secret-access-key'] || '';
+        const reqAwsRegion = req.headers['x-aws-region'] || 'ap-southeast-2';
+        const reqAwsS3Bucket = req.headers['x-aws-s3-bucket'] || '';
 
         if (!reqAwsAccessKeyId || !reqAwsSecretAccessKey || !reqAwsS3Bucket) {
             return res.status(400).json({ error: 'សូមបំពេញ AWS Keys និង S3 Bucket ឱ្យបានពេញលេញសិន' });
@@ -913,22 +1037,31 @@ const hash = crypto.createHash('sha256');
                throw new Error('FFmpeg mix error: ' + (e.stderr || e.message).substring(0, 500));
            }
            
-           finalMapA = hasOriginalAudio ? '1:a' : '0:a';
+           finalMapA = '1:a';
         } else if (hasOriginalAudio) {
            finalMapA = '0:a';
         }
-        // STEP 2: Export Video WITHOUT burned-in subtitles
-let needsVideoReencode = false;
-let vFilter = '';
-let mapV = '0:v';
+        
+        // STEP 2: Encode Video and add Subtitles
+        let needsVideoReencode = false;
+        let vFilter = '';
+        let mapV = '0:v';
+        
+        if (srtFile) {
+           const escapedSrtPath = srtFile.path.replace(/\\/g, '/').replace(/'/g, "\\\'").replace(/:/g, "\\:");
+           // Force Khmer-capable font for FFmpeg/libass
+// Noto Sans Khmer is installed on the server.
+vFilter = `subtitles='${escapedSrtPath}':fontsdir='/home/ubuntu/ai-dinmagic/fonts':force_style='FontName=Noto Sans Khmer,FontSize=24,BorderStyle=1,Outline=2,Shadow=0,MarginV=40'`;
 
-
-        let videoCmd = `ffmpeg -nostdin -hide_banner -loglevel info -i "${videoPath}"`;
+        }
+        
+        let videoCmd = `ffmpeg -nostdin -hide_banner -loglevel error -i "${videoPath}"`;
         if (audioFiles.length > 0) {
             videoCmd += ` -i "${tempMixedAudio}"`;
         }
         
         if (vFilter) {
+            videoCmd += ` -filter_complex "${vFilter}[vout]"`;
         }
         
         videoCmd += ` -map "${mapV}"`;
@@ -953,84 +1086,32 @@ let mapV = '0:v';
         const tempOutputVideoPath = path.join(os.tmpdir(), `.final_${jobId}.tmp.mp4`);
         videoCmd = videoCmd.replace(`"${outputVideoPath}"`, `"${tempOutputVideoPath}"`);
         
-        // Export progress: 50% -> 90% based on real FFmpeg time.
-        // Progress is monotonic and can never move backwards.
-        exportJobs.set(jobId, { status: 'processing', progress: 50 });
-
-        let exportDuration = 0;
-        try {
-            const durationCmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`;
-            const { stdout: durationOut } = await execAsync(durationCmd);
-            exportDuration = Number(durationOut.trim()) || 0;
-        } catch (e) {
-            exportDuration = 0;
-        }
-
-        let lastExportProgress = 50;
-
+        exportJobs.set(jobId, { status: 'processing', progress: 10 });
+        
         await new Promise((resolve, reject) => {
+            
+            // use shell for easier parsing of the command
             const child = spawn(videoCmd, { shell: true });
-
-            let ffmpegOutputBuffer = '';
-
+            
             child.stderr.on('data', (data) => {
-                ffmpegOutputBuffer += data.toString();
-
-                // Keep a bounded buffer so partial stderr chunks are handled safely.
-                if (ffmpegOutputBuffer.length > 20000) {
-                    ffmpegOutputBuffer = ffmpegOutputBuffer.slice(-10000);
-                }
-
-                // Find the latest FFmpeg time=HH:MM:SS.xx value.
-                const matches = [
-                    ...ffmpegOutputBuffer.matchAll(/time=(\d+):(\d+):(\d+\.\d+)/g)
-                ];
-
-                if (matches.length > 0 && exportDuration > 0) {
-                    const match = matches[matches.length - 1];
-
-                    const currentTime =
-                        Number(match[1]) * 3600 +
-                        Number(match[2]) * 60 +
-                        Number(match[3]);
-
-                    const ffmpegPercent = Math.min(
-                        100,
-                        (currentTime / exportDuration) * 100
-                    );
-
-                    // Map FFmpeg 0-100% to UI 50-90%.
-                    const calculatedProgress = Math.min(
-                        90,
-                        50 + Math.floor(ffmpegPercent * 0.40)
-                    );
-
-                    // Progress must NEVER move backwards.
-                    if (calculatedProgress > lastExportProgress) {
-                        lastExportProgress = calculatedProgress;
-
-                        exportJobs.set(jobId, {
-                            status: 'processing',
-                            progress: calculatedProgress
-                        });
+                const str = data.toString();
+                if (str.includes('time=')) {
+                    // Try to extract time=HH:MM:SS.ms
+                    const match = str.match(/time=(\d+):(\d+):(\d+\.\d+)/);
+                    if (match) {
+                        exportJobs.set(jobId, { status: 'processing', progress: 50 });
                     }
                 }
             });
-
+            
             child.on('close', (code) => {
-                if (code === 0) {
-                    exportJobs.set(jobId, {
-                        status: 'processing',
-                        progress: 90
-                    });
-                    resolve(true);
-                } else {
-                    reject(new Error('FFmpeg exited with code ' + code));
-                }
+                if (code === 0) resolve(true);
+                else reject(new Error('FFmpeg exited with code ' + code));
             });
-
             child.on('error', reject);
         });
+
+        exportJobs.set(jobId, { status: 'processing', progress: 90 });
         
         // Validate with ffprobe
         currentCmd = `ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1:nokey=1 "${tempOutputVideoPath}"`;

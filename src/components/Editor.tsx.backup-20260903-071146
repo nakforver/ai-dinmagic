@@ -12,12 +12,11 @@ interface EditorProps {
   awsSecretAccessKey: string;
   awsRegion: string;
   awsS3Bucket: string;
-  workflow: string;
   voice: 'Piseth' | 'Sreymom';
   model: string;
 }
 
-export default function Editor({ onNavigate, videoFile, apiKey, awsAccessKeyId, awsSecretAccessKey, awsRegion, awsS3Bucket, workflow, voice, model }: EditorProps) {
+export default function Editor({ onNavigate, videoFile, apiKey, awsAccessKeyId, awsSecretAccessKey, awsRegion, awsS3Bucket, voice, model }: EditorProps) {
   const [lines, setLines] = useState<SubtitleLine[]>([]);
 
   const linesRef = useRef<SubtitleLine[]>([]);
@@ -155,7 +154,6 @@ const videoRef = useRef<HTMLVideoElement>(null);
            fileId, 
            mimetype: videoFile.type || 'video/mp4', 
            model,
-           workflow,
            totalChunks
         }),
       });

@@ -179,6 +179,7 @@ export default function Settings({
       onChange={(e) => setWorkflow(e.target.value)}
     >
       <option value="amazon">AWS Transcribe → Gemini Translate</option>
+      <option value="qwen-khmer">Qwen Khmer ASR → Gemini Translate</option>
       <option value="gemini">Gemini → Transcribe + Translate</option>
     </select>
 
@@ -187,7 +188,9 @@ export default function Settings({
         <p className="text-sm font-semibold text-white">
           {workflow === 'amazon'
             ? 'AWS Transcribe → Gemini Translate'
-            : 'Gemini → Transcribe + Translate'}
+            : workflow === 'qwen-khmer'
+              ? 'Qwen Khmer ASR → Gemini Translate'
+              : 'Gemini → Transcribe + Translate'}
         </p>
         <p className="text-[11px] text-gray-500 mt-1">
           ជ្រើសរើសវិធី Transcription និង Translation
